@@ -1,7 +1,8 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{Env, String};
+use soroban_sdk::{Env, String, Address};
+use soroban_sdk::testutils::Address as TestAddress;
 
 #[test]
 fn test_basic_functionality() {
@@ -367,7 +368,7 @@ fn test_erc721_multiple_contracts_stress() {
     let env = Env::default();
     
     // Create multiple contracts and test them
-    for i in 0..10 {
+    for _ in 0..10 {
         let contract_id = env.register(NFTContract, (
             String::from_str(&env, "NFT Collection"),
             String::from_str(&env, "NFT"),
@@ -411,4 +412,45 @@ fn test_erc721_metadata_edge_cases() {
         assert_eq!(retrieved_name, String::from_str(&env, name));
         assert_eq!(retrieved_symbol, String::from_str(&env, symbol));
     }
+}
+
+// test the mint function
+#[test]
+fn test_mint_function() {
+    let env = Env::default();
+    let creator = Address::generate(&env);
+    let user = Address::generate(&env);
+    let contract_id = env.register(NFTContract, (
+        String::from_str(&env, "Test NFT"),
+        String::from_str(&env, "TNFT"),
+        String::from_str(&env, "https://example.com/token/"),
+        &creator,
+    ));
+    let client = NFTContractClient::new(&env, &contract_id);
+    
+    // Mock authentication for the creator address
+    env.mock_all_auths();
+
+    // Test minting functionality - the creator should be able to mint since they're the owner
+    let token_id = client.mint(&user);
+    assert_eq!(token_id, 0);
+
+    // Verify the token was minted by checking balance
+    let balance = client.balance(&user);
+    assert_eq!(balance, 1);
+
+    // Verify the token owner
+    let token_owner = client.owner_of(&0);
+    assert_eq!(token_owner, user);
+    assert_eq!(client.tokens_of_owner(&user).len(), 1);
+
+    // Test minting another token
+    let token_id_2 = client.mint(&user);
+    assert_eq!(token_id_2, 1);
+    assert_eq!(client.tokens_of_owner(&user).len(), 2);
+    
+    let balance_after_second_mint = client.balance(&user);
+    assert_eq!(balance_after_second_mint, 2);
+
+    assert_eq!(client.tokens_of_owner(&creator).len(), 0);
 }
