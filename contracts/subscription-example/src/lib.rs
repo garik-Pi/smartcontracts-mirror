@@ -35,6 +35,14 @@ impl SubscriptionContract {
         price: i128,
         period_secs: u64,
     ) {
+        if price <= 0 {
+            panic!("price can not be negative");
+        }
+
+        if period_secs <= 0 {
+            panic!("period_secs can not be negative");
+        }
+
         subscriber.require_auth();
 
         let now = env.ledger().timestamp();
@@ -82,7 +90,7 @@ impl SubscriptionContract {
             token_client.try_transfer_from(&contract_addr, &subscriber, &sub.merchant, &sub.price);
 
         if payment_result.is_ok() {
-            sub.next_charge_ts += sub.period_secs;
+            sub.next_charge_ts = now + sub.period_secs;
             env.storage().persistent().set(&key, &sub);
         }
     }
@@ -91,15 +99,19 @@ impl SubscriptionContract {
         env.storage().persistent().get(&key_for(&subscriber))
     }
 
-    pub fn cancel(env: Env, user: Address) {
-        user.require_auth();
+    pub fn cancel(env: Env, subscriber: Address) {
+        subscriber.require_auth();
 
-        let key = key_for(&user);
+        let key = key_for(&subscriber);
 
         let mut sub: Subscription = match env.storage().persistent().get(&key) {
             Some(s) => s,
             None => return,
         };
+
+        if !sub.is_active {
+            return;
+        }
 
         sub.is_active = false;
 
