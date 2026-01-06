@@ -36,11 +36,11 @@ impl SubscriptionContract {
         period_secs: u64,
     ) {
         if price <= 0 {
-            panic!("price can not be negative");
+            panic!("price must be positive");
         }
 
         if period_secs <= 0 {
-            panic!("period_secs can not be negative");
+            panic!("period_secs must be positive");
         }
 
         subscriber.require_auth();
