@@ -505,7 +505,7 @@
                   "map": [
                     {
                       "key": {
-                        "symbol": "approve_periods_secs"
+                        "symbol": "approve_periods"
                       },
                       "val": {
                         "u64": 12

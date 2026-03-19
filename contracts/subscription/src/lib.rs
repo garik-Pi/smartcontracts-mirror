@@ -65,7 +65,7 @@ pub struct Service {
     pub price: i128,
     pub period_secs: u64,
     pub trial_period_secs: u64,
-    pub approve_periods_secs: u64,
+    pub approve_periods: u64,
     pub is_active: bool,
     pub created_at: u64,
 }
@@ -197,7 +197,7 @@ impl SubscriptionContract {
         price: i128,
         period_secs: u64,
         trial_period_secs: u64,
-        approve_periods_secs: u64,
+        approve_periods: u64,
     ) -> Result<Service, ContractError> {
         if price <= 0 {
             return Err(ContractError::InvalidPrice);
@@ -208,7 +208,7 @@ impl SubscriptionContract {
         if name.len() == 0 {
             return Err(ContractError::InvalidServiceName);
         }
-        if approve_periods_secs == 0 {
+        if approve_periods == 0 {
             return Err(ContractError::InvalidPeriod);
         }
 
@@ -224,7 +224,7 @@ impl SubscriptionContract {
             price,
             period_secs,
             trial_period_secs,
-            approve_periods_secs,
+            approve_periods,
             is_active: true,
             created_at: now,
         };
@@ -260,7 +260,7 @@ impl SubscriptionContract {
     /// merchant-initiated `process()` calls.
     ///
     /// **With trial period:**
-    /// - `pay_upfront = true`  – approves the contract for `approve_periods_secs`
+    /// - `pay_upfront = true`  – approves the contract for `approve_periods`
     ///   future periods; no immediate payment. After the trial, `process()`
     ///   charges each period.
     /// - `pay_upfront = false` – subscription covers the trial period only;
@@ -268,7 +268,7 @@ impl SubscriptionContract {
     ///
     /// **Without trial period:**
     /// - `pay_upfront = true`  – immediately transfers the first period's price
-    ///   and approves the contract for `approve_periods_secs` future periods.
+    ///   and approves the contract for `approve_periods` future periods.
     /// - `pay_upfront = false` – immediately transfers the first period's price
     ///   and approves the contract for 1 period.  `process()` will skip this
     ///   subscription, so it expires after the paid period unless extended via
@@ -315,7 +315,7 @@ impl SubscriptionContract {
 
             if pay_upfront {
                 // Trial + pay_upfront: approve for 12 periods, no immediate payment
-                do_approve(&env, &subscriber, &service, service.approve_periods_secs);
+                do_approve(&env, &subscriber, &service, service.approve_periods);
 
                 let balance = token_client.balance(&subscriber);
                 if balance < service.price {
@@ -347,7 +347,7 @@ impl SubscriptionContract {
             let period_end = checked_add_ts(now, service.period_secs)?;
 
             // Approve for future charges
-            let periods = if pay_upfront { service.approve_periods_secs } else { 1 };
+            let periods = if pay_upfront { service.approve_periods } else { 1 };
             do_approve(&env, &subscriber, &service, periods);
 
             if pay_upfront {
@@ -484,7 +484,7 @@ impl SubscriptionContract {
                 .get(&svc_key)
                 .ok_or(ContractError::ServiceNotFound)?;
 
-            do_approve(&env, &subscriber, &service, service.approve_periods_secs);
+            do_approve(&env, &subscriber, &service, service.approve_periods);
         }
 
         env.storage().persistent().set(&sub_key, &sub);
@@ -503,7 +503,7 @@ impl SubscriptionContract {
     ///
     /// Call this when your allowance is running low and you want the
     /// subscription to continue renewing.  Sets `pay_upfront` to `true`
-    /// and approves the contract for `approve_periods_secs` future periods.
+    /// and approves the contract for `approve_periods` future periods.
     pub fn extend_subscription(
         env: Env,
         subscriber: Address,
@@ -534,7 +534,7 @@ impl SubscriptionContract {
             .get(&svc_key)
             .ok_or(ContractError::ServiceNotFound)?;
 
-        do_approve(&env, &subscriber, &service, service.approve_periods_secs);
+        do_approve(&env, &subscriber, &service, service.approve_periods);
 
         sub.pay_upfront = true;
         env.storage().persistent().set(&sub_key, &sub);
