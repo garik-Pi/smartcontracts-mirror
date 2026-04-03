@@ -31,6 +31,7 @@ pub enum ContractError {
     NotServiceOwner = 9,
     InvalidServiceName = 10,
     SubscriptionExpired = 11,
+    ServiceNotActive = 12,
 }
 
 // ---------------------------------------------------------------------------
@@ -92,6 +93,7 @@ pub struct ProcessResult {
     pub charged: u32,
     pub failed: u32,
     pub skipped: u32,
+    pub total: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -145,19 +147,33 @@ fn get_token(env: &Env) -> Address {
     env.storage().instance().get(&DataKey::Token).unwrap()
 }
 
-fn do_approve(env: &Env, subscriber: &Address, service: &Service, periods: u64) {
+fn do_approve(
+    env: &Env,
+    subscriber: &Address,
+    service: &Service,
+    periods: u64,
+    extra_secs: u64,
+) -> Result<(), ContractError> {
     let token = get_token(env);
     let token_client = TokenClient::new(env, &token);
     let contract_addr = env.current_contract_address();
 
-    let approve_amount = service.price * (periods as i128);
-    let secs_to_approve = service.period_secs.saturating_mul(periods);
+    let approve_amount = service
+        .price
+        .checked_mul(periods as i128)
+        .ok_or(ContractError::TimestampOverflow)?;
+    let secs_to_approve = service
+        .period_secs
+        .saturating_mul(periods)
+        .saturating_add(extra_secs);
     let ledgers_to_approve = secs_to_approve / 5;
     let capped_ledgers = if ledgers_to_approve > u32::MAX as u64 {
         u32::MAX
     } else {
         ledgers_to_approve as u32
     };
+    let max_ttl = env.storage().max_ttl().saturating_sub(1);
+    let capped_ledgers = core::cmp::min(capped_ledgers, max_ttl);
     let expiration_ledger = env.ledger().sequence().saturating_add(capped_ledgers);
 
     token_client.approve(
@@ -169,8 +185,16 @@ fn do_approve(env: &Env, subscriber: &Address, service: &Service, periods: u64) 
 
     env.events().publish(
         (symbol_short!("approve"),),
-        (subscriber.clone(), service.service_id, approve_amount, expiration_ledger),
+        (
+            subscriber.clone(),
+            service.service_id,
+            approve_amount,
+            expiration_ledger,
+            token,
+        ),
     );
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -289,7 +313,7 @@ impl SubscriptionContract {
             .ok_or(ContractError::ServiceNotFound)?;
 
         if !service.is_active {
-            return Err(ContractError::ServiceNotFound);
+            return Err(ContractError::ServiceNotActive);
         }
 
         // ---- Dedup check ----
@@ -314,8 +338,14 @@ impl SubscriptionContract {
             let trial_end = checked_add_ts(now, service.trial_period_secs)?;
 
             if pay_upfront {
-                // Trial + pay_upfront: approve for 12 periods, no immediate payment
-                do_approve(&env, &subscriber, &service, service.approve_periods);
+                // Trial + pay_upfront: approve for future periods; extra_secs covers the trial
+                do_approve(
+                    &env,
+                    &subscriber,
+                    &service,
+                    service.approve_periods,
+                    service.trial_period_secs,
+                )?;
 
                 let balance = token_client.balance(&subscriber);
                 if balance < service.price {
@@ -341,14 +371,14 @@ impl SubscriptionContract {
                 created_at: now,
             }
         } else {
-            // No trial – immediate first payment
-            token_client.transfer(&subscriber, &service.merchant, &service.price);
-
             let period_end = checked_add_ts(now, service.period_secs)?;
 
-            // Approve for future charges
+            // Approve before transfer so the contract is pre-authorized
             let periods = if pay_upfront { service.approve_periods } else { 1 };
-            do_approve(&env, &subscriber, &service, periods);
+            do_approve(&env, &subscriber, &service, periods, 0)?;
+
+            // No trial – immediate first payment
+            token_client.transfer(&subscriber, &service.merchant, &service.price);
 
             if pay_upfront {
                 let balance = token_client.balance(&subscriber);
@@ -484,7 +514,7 @@ impl SubscriptionContract {
                 .get(&svc_key)
                 .ok_or(ContractError::ServiceNotFound)?;
 
-            do_approve(&env, &subscriber, &service, service.approve_periods);
+            do_approve(&env, &subscriber, &service, service.approve_periods, 0)?;
         }
 
         env.storage().persistent().set(&sub_key, &sub);
@@ -534,7 +564,7 @@ impl SubscriptionContract {
             .get(&svc_key)
             .ok_or(ContractError::ServiceNotFound)?;
 
-        do_approve(&env, &subscriber, &service, service.approve_periods);
+        do_approve(&env, &subscriber, &service, service.approve_periods, 0)?;
 
         sub.pay_upfront = true;
         env.storage().persistent().set(&sub_key, &sub);
@@ -553,6 +583,8 @@ impl SubscriptionContract {
         env: Env,
         merchant: Address,
         service_id: u64,
+        offset: u32,
+        limit: u32,
     ) -> Result<ProcessResult, ContractError> {
         merchant.require_auth();
 
@@ -579,19 +611,25 @@ impl SubscriptionContract {
             .get(&svc_subs_key)
             .unwrap_or_else(|| Vec::new(&env));
 
+        let total = sub_ids.len();
+        let start = (offset as u32).min(total);
+        let end = start.saturating_add(limit).min(total);
+
         let mut charged: u32 = 0;
         let mut failed: u32 = 0;
         let mut skipped: u32 = 0;
 
-        for i in 0..sub_ids.len() {
+        for i in start..end {
             let sid = sub_ids.get(i).unwrap();
             let sub_key = DataKey::Sub(sid);
 
-            let mut sub: Subscription = env
-                .storage()
-                .persistent()
-                .get(&sub_key)
-                .expect("subscription not found");
+            let mut sub: Subscription = match env.storage().persistent().get(&sub_key) {
+                Some(s) => s,
+                None => {
+                    skipped += 1;
+                    continue;
+                }
+            };
 
             if !sub.pay_upfront {
                 skipped += 1;
@@ -672,6 +710,7 @@ impl SubscriptionContract {
             charged,
             failed,
             skipped,
+            total,
         })
     }
 
@@ -690,6 +729,7 @@ impl SubscriptionContract {
             .persistent()
             .get(&sub_key)
             .ok_or(ContractError::SubscriptionNotFound)?;
+        bump_persistent(&env, &sub_key);
 
         if caller != sub.subscriber {
             let svc_key = DataKey::Service(sub.service_id);
@@ -698,6 +738,7 @@ impl SubscriptionContract {
                 .persistent()
                 .get(&svc_key)
                 .ok_or(ContractError::ServiceNotFound)?;
+            bump_persistent(&env, &svc_key);
             if caller != service.merchant {
                 return Err(ContractError::Unauthorized);
             }
@@ -715,16 +756,16 @@ impl SubscriptionContract {
             .persistent()
             .get(&ss_key)
             .unwrap_or_else(|| Vec::new(&env));
+        bump_persistent(&env, &ss_key);
 
         let mut result: Vec<Subscription> = Vec::new(&env);
         for i in 0..sub_ids.len() {
             let sid = sub_ids.get(i).unwrap();
-            let sub: Subscription = env
-                .storage()
-                .persistent()
-                .get(&DataKey::Sub(sid))
-                .expect("subscription not found");
-            result.push_back(sub);
+            let sub_key = DataKey::Sub(sid);
+            if let Some(sub) = env.storage().persistent().get::<_, Subscription>(&sub_key) {
+                bump_persistent(&env, &sub_key);
+                result.push_back(sub);
+            }
         }
         result
     }
@@ -753,26 +794,29 @@ impl SubscriptionContract {
             .persistent()
             .get(&svc_subs_key)
             .unwrap_or_else(|| Vec::new(&env));
+        bump_persistent(&env, &svc_subs_key);
 
         let mut result: Vec<Subscription> = Vec::new(&env);
         for i in 0..sub_ids.len() {
             let sid = sub_ids.get(i).unwrap();
-            let sub: Subscription = env
-                .storage()
-                .persistent()
-                .get(&DataKey::Sub(sid))
-                .expect("subscription not found");
-            result.push_back(sub);
+            let sub_key = DataKey::Sub(sid);
+            if let Some(sub) = env.storage().persistent().get::<_, Subscription>(&sub_key) {
+                bump_persistent(&env, &sub_key);
+                result.push_back(sub);
+            }
         }
         Ok(result)
     }
 
     pub fn get_service(env: Env, service_id: u64) -> Result<Service, ContractError> {
         let svc_key = DataKey::Service(service_id);
-        env.storage()
+        let service: Service = env
+            .storage()
             .persistent()
             .get(&svc_key)
-            .ok_or(ContractError::ServiceNotFound)
+            .ok_or(ContractError::ServiceNotFound)?;
+        bump_persistent(&env, &svc_key);
+        Ok(service)
     }
 
     pub fn get_merchant_services(env: Env, merchant: Address) -> Vec<Service> {
@@ -782,16 +826,16 @@ impl SubscriptionContract {
             .persistent()
             .get(&ms_key)
             .unwrap_or_else(|| Vec::new(&env));
+        bump_persistent(&env, &ms_key);
 
         let mut result: Vec<Service> = Vec::new(&env);
         for i in 0..svc_ids.len() {
             let sid = svc_ids.get(i).unwrap();
-            let svc: Service = env
-                .storage()
-                .persistent()
-                .get(&DataKey::Service(sid))
-                .expect("service not found");
-            result.push_back(svc);
+            let svc_key = DataKey::Service(sid);
+            if let Some(svc) = env.storage().persistent().get::<_, Service>(&svc_key) {
+                bump_persistent(&env, &svc_key);
+                result.push_back(svc);
+            }
         }
         result
     }
@@ -802,11 +846,13 @@ impl SubscriptionContract {
             Some(id) => id,
             None => return false,
         };
-        let sub: Subscription = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Sub(sub_id))
-            .expect("subscription not found");
+        bump_persistent(&env, &pair_key);
+        let sub_key = DataKey::Sub(sub_id);
+        let sub: Subscription = match env.storage().persistent().get(&sub_key) {
+            Some(s) => s,
+            None => return false,
+        };
+        bump_persistent(&env, &sub_key);
         env.ledger().timestamp() < sub.service_end_ts
     }
 
@@ -824,7 +870,7 @@ impl SubscriptionContract {
     }
 
     pub fn version(_env: Env) -> u32 {
-        3
+        1
     }
 }
 

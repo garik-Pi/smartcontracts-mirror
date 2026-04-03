@@ -304,7 +304,7 @@ fn test_subscribe_with_trial_no_pay_upfront() {
     );
 
     // Process won't charge since pay_upfront=false
-    let result = s.client.process(&s.merchant, &svc.service_id);
+    let result = s.client.process(&s.merchant, &svc.service_id, &0, &100);
     assert_eq!(result.charged, 0);
     assert_eq!(result.skipped, 1);
 }
@@ -587,7 +587,7 @@ fn test_extend_subscription_from_no_pay_upfront() {
     s.token
         .approve(&s.subscriber, &s.contract_addr, &INITIAL_BALANCE, &10000);
     advance_time(&s.env, MONTH + 1);
-    let result = s.client.process(&s.merchant, &svc.service_id);
+    let result = s.client.process(&s.merchant, &svc.service_id, &0, &100);
     assert_eq!(result.charged, 1);
 }
 
@@ -635,7 +635,7 @@ fn test_process_single_charge() {
 
     advance_time(&s.env, MONTH + 1);
 
-    let result = s.client.process(&s.merchant, &svc.service_id);
+    let result = s.client.process(&s.merchant, &svc.service_id, &0, &100);
     assert_eq!(result.charged, 1);
     assert_eq!(result.failed, 0);
     assert_eq!(result.skipped, 0);
@@ -660,7 +660,7 @@ fn test_process_batch_multiple_subscribers() {
 
     advance_time(&s.env, MONTH + 1);
 
-    let result = s.client.process(&s.merchant, &svc.service_id);
+    let result = s.client.process(&s.merchant, &svc.service_id, &0, &100);
     assert_eq!(result.charged, 2);
     assert_eq!(result.failed, 0);
     assert_eq!(result.skipped, 0);
@@ -680,7 +680,7 @@ fn test_process_insufficient_funds() {
 
     advance_time(&s.env, MONTH + 1);
 
-    let result = s.client.process(&s.merchant, &svc.service_id);
+    let result = s.client.process(&s.merchant, &svc.service_id, &0, &100);
     assert_eq!(result.charged, 0);
     assert_eq!(result.failed, 1);
     assert_eq!(result.skipped, 0);
@@ -697,7 +697,7 @@ fn test_process_before_due() {
     s.client.subscribe(&s.subscriber, &svc.service_id, &true);
 
     // Don't advance time
-    let result = s.client.process(&s.merchant, &svc.service_id);
+    let result = s.client.process(&s.merchant, &svc.service_id, &0, &100);
     assert_eq!(result.charged, 0);
     assert_eq!(result.failed, 0);
     assert_eq!(result.skipped, 1);
@@ -719,7 +719,7 @@ fn test_process_no_drift() {
     // Advance 5 days past due
     advance_time(&s.env, MONTH + 5 * DAY);
 
-    let result = s.client.process(&s.merchant, &svc.service_id);
+    let result = s.client.process(&s.merchant, &svc.service_id, &0, &100);
     assert_eq!(result.charged, 1);
 
     // next_charge_ts = old_next_charge_ts + period, not now + period
@@ -734,7 +734,7 @@ fn test_process_wrong_merchant() {
     let svc = register_default_service(&s);
     s.client.subscribe(&s.subscriber, &svc.service_id, &true);
 
-    let result = s.client.try_process(&s.merchant2, &svc.service_id);
+    let result = s.client.try_process(&s.merchant2, &svc.service_id, &0, &100);
     assert_eq!(result, Err(Ok(ContractError::NotServiceOwner)));
 }
 
@@ -754,7 +754,7 @@ fn test_process_trial_expiry_and_first_charge() {
     // Advance past trial
     advance_time(&s.env, WEEK + 1);
 
-    let result = s.client.process(&s.merchant, &svc.service_id);
+    let result = s.client.process(&s.merchant, &svc.service_id, &0, &100);
     assert_eq!(result.charged, 1);
 
     let sub = s.client.get_subscription(&s.subscriber, &0);
@@ -776,7 +776,7 @@ fn test_process_skips_no_pay_upfront() {
 
     advance_time(&s.env, MONTH + 1);
 
-    let result = s.client.process(&s.merchant, &svc.service_id);
+    let result = s.client.process(&s.merchant, &svc.service_id, &0, &100);
     assert_eq!(result.charged, 0);
     assert_eq!(result.failed, 0);
     assert_eq!(result.skipped, 1);
@@ -888,13 +888,13 @@ fn test_upgrade() {
     let s = setup();
     let wasm_hash = s.env.deployer().upload_contract_wasm(upgrade_wasm::WASM);
     s.client.upgrade(&wasm_hash);
-    assert_eq!(s.client.version(), 3);
+    assert_eq!(s.client.version(), 1);
 }
 
 #[test]
 fn test_version() {
     let s = setup();
-    assert_eq!(s.client.version(), 3);
+    assert_eq!(s.client.version(), 1);
 }
 
 // ===========================================================================
