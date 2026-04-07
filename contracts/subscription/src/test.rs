@@ -195,13 +195,13 @@ fn test_get_service_not_found() {
 // ===========================================================================
 
 #[test]
-fn test_subscribe_no_trial_pay_upfront() {
+fn test_subscribe_no_trial_auto_renew() {
     let s = setup();
     let svc = register_default_service(&s);
 
     let sub = s.client.subscribe(&s.subscriber, &svc.service_id, &true);
 
-    assert_eq!(sub.pay_upfront, true);
+    assert_eq!(sub.auto_renew, true);
     assert_eq!(sub.price, PRICE);
     assert_eq!(sub.period_secs, MONTH);
     assert_eq!(sub.trial_period_secs, 0);
@@ -221,13 +221,13 @@ fn test_subscribe_no_trial_pay_upfront() {
 }
 
 #[test]
-fn test_subscribe_no_trial_no_pay_upfront() {
+fn test_subscribe_no_trial_no_auto_renew() {
     let s = setup();
     let svc = register_default_service(&s);
 
     let sub = s.client.subscribe(&s.subscriber, &svc.service_id, &false);
 
-    assert_eq!(sub.pay_upfront, false);
+    assert_eq!(sub.auto_renew, false);
     assert_eq!(sub.price, PRICE);
 
     // Immediate charge still happens for first period
@@ -250,13 +250,13 @@ fn test_subscribe_no_trial_no_pay_upfront() {
 }
 
 #[test]
-fn test_subscribe_with_trial_pay_upfront() {
+fn test_subscribe_with_trial_auto_renew() {
     let s = setup();
     let svc = register_trial_service(&s);
 
     let sub = s.client.subscribe(&s.subscriber, &svc.service_id, &true);
 
-    assert_eq!(sub.pay_upfront, true);
+    assert_eq!(sub.auto_renew, true);
     assert_eq!(sub.trial_period_secs, WEEK);
     assert_eq!(sub.trial_end_ts, WEEK);
     assert_eq!(sub.service_end_ts, WEEK);
@@ -274,13 +274,13 @@ fn test_subscribe_with_trial_pay_upfront() {
 }
 
 #[test]
-fn test_subscribe_with_trial_no_pay_upfront() {
+fn test_subscribe_with_trial_no_auto_renew() {
     let s = setup();
     let svc = register_trial_service(&s);
 
     let sub = s.client.subscribe(&s.subscriber, &svc.service_id, &false);
 
-    assert_eq!(sub.pay_upfront, false);
+    assert_eq!(sub.auto_renew, false);
     assert_eq!(sub.trial_period_secs, WEEK);
     assert_eq!(sub.trial_end_ts, WEEK);
     assert_eq!(sub.service_end_ts, WEEK);
@@ -303,7 +303,7 @@ fn test_subscribe_with_trial_no_pay_upfront() {
         false
     );
 
-    // Process won't charge since pay_upfront=false
+    // Process won't charge since auto_renew=false
     let result = s.client.process(&s.merchant, &svc.service_id, &0, &100);
     assert_eq!(result.charged, 0);
     assert_eq!(result.skipped, 1);
@@ -367,7 +367,7 @@ fn test_subscribe_resubscribe_after_expiry() {
 
     // Re-subscribe should work
     let sub2 = s.client.subscribe(&s.subscriber, &svc.service_id, &true);
-    assert_eq!(sub2.pay_upfront, true);
+    assert_eq!(sub2.auto_renew, true);
     assert!(sub2.sub_id != sub.sub_id);
 }
 
@@ -385,7 +385,7 @@ fn test_cancel_subscription() {
     s.client.cancel(&s.subscriber, &sub.sub_id);
 
     let updated = s.client.get_subscription(&s.subscriber, &sub.sub_id);
-    assert_eq!(updated.pay_upfront, false);
+    assert_eq!(updated.auto_renew, false);
     assert_eq!(updated.service_end_ts, MONTH);
 
     // Service still active mid-period
@@ -466,22 +466,22 @@ fn test_cancel_during_trial() {
 // ===========================================================================
 
 #[test]
-fn test_toggle_pay_upfront_off() {
+fn test_toggle_auto_renew_off() {
     let s = setup();
     let svc = register_default_service(&s);
     let sub = s.client.subscribe(&s.subscriber, &svc.service_id, &true);
 
     advance_time(&s.env, 10 * DAY);
 
-    let result = s.client.toggle_pay_upfront(&s.subscriber, &sub.sub_id);
+    let result = s.client.toggle_auto_renew(&s.subscriber, &sub.sub_id);
     assert_eq!(result, false);
 
     let updated = s.client.get_subscription(&s.subscriber, &sub.sub_id);
-    assert_eq!(updated.pay_upfront, false);
+    assert_eq!(updated.auto_renew, false);
 }
 
 #[test]
-fn test_toggle_pay_upfront_back_on() {
+fn test_toggle_auto_renew_back_on() {
     let s = setup();
     let svc = register_default_service(&s);
     let sub = s.client.subscribe(&s.subscriber, &svc.service_id, &true);
@@ -489,19 +489,19 @@ fn test_toggle_pay_upfront_back_on() {
     advance_time(&s.env, 10 * DAY);
 
     // Toggle off
-    let r1 = s.client.toggle_pay_upfront(&s.subscriber, &sub.sub_id);
+    let r1 = s.client.toggle_auto_renew(&s.subscriber, &sub.sub_id);
     assert_eq!(r1, false);
 
     // Toggle back on (still within service_end_ts)
-    let r2 = s.client.toggle_pay_upfront(&s.subscriber, &sub.sub_id);
+    let r2 = s.client.toggle_auto_renew(&s.subscriber, &sub.sub_id);
     assert_eq!(r2, true);
 
     let updated = s.client.get_subscription(&s.subscriber, &sub.sub_id);
-    assert_eq!(updated.pay_upfront, true);
+    assert_eq!(updated.auto_renew, true);
 }
 
 #[test]
-fn test_toggle_pay_upfront_expired_fails() {
+fn test_toggle_auto_renew_expired_fails() {
     let s = setup();
     let svc = register_default_service(&s);
     let sub = s.client.subscribe(&s.subscriber, &svc.service_id, &true);
@@ -513,19 +513,19 @@ fn test_toggle_pay_upfront_expired_fails() {
     // Cannot re-enable on expired sub
     let result = s
         .client
-        .try_toggle_pay_upfront(&s.subscriber, &sub.sub_id);
+        .try_toggle_auto_renew(&s.subscriber, &sub.sub_id);
     assert_eq!(result, Err(Ok(ContractError::SubscriptionExpired)));
 }
 
 #[test]
-fn test_toggle_pay_upfront_wrong_subscriber() {
+fn test_toggle_auto_renew_wrong_subscriber() {
     let s = setup();
     let svc = register_default_service(&s);
     let sub = s.client.subscribe(&s.subscriber, &svc.service_id, &true);
 
     let result = s
         .client
-        .try_toggle_pay_upfront(&s.subscriber2, &sub.sub_id);
+        .try_toggle_auto_renew(&s.subscriber2, &sub.sub_id);
     assert_eq!(result, Err(Ok(ContractError::Unauthorized)));
 }
 
@@ -544,44 +544,44 @@ fn test_extend_subscription() {
     let extended = s
         .client
         .extend_subscription(&s.subscriber, &sub.sub_id);
-    assert_eq!(extended.pay_upfront, true);
+    assert_eq!(extended.auto_renew, true);
     assert_eq!(extended.sub_id, sub.sub_id);
 }
 
 #[test]
-fn test_extend_subscription_reactivates_pay_upfront() {
+fn test_extend_subscription_reactivates_auto_renew() {
     let s = setup();
     let svc = register_default_service(&s);
     let sub = s.client.subscribe(&s.subscriber, &svc.service_id, &true);
 
-    // Cancel (sets pay_upfront to false)
+    // Cancel (sets auto_renew to false)
     s.client.cancel(&s.subscriber, &sub.sub_id);
     let cancelled = s.client.get_subscription(&s.subscriber, &sub.sub_id);
-    assert_eq!(cancelled.pay_upfront, false);
+    assert_eq!(cancelled.auto_renew, false);
 
     // Extend while still within service period
     advance_time(&s.env, 10 * DAY);
     let extended = s
         .client
         .extend_subscription(&s.subscriber, &sub.sub_id);
-    assert_eq!(extended.pay_upfront, true);
+    assert_eq!(extended.auto_renew, true);
 }
 
 #[test]
-fn test_extend_subscription_from_no_pay_upfront() {
+fn test_extend_subscription_from_no_auto_renew() {
     let s = setup();
     let svc = register_default_service(&s);
 
-    // Subscribe without pay_upfront (one-time)
+    // Subscribe without auto_renew (one-time)
     let sub = s.client.subscribe(&s.subscriber, &svc.service_id, &false);
-    assert_eq!(sub.pay_upfront, false);
+    assert_eq!(sub.auto_renew, false);
 
     // Decide to continue: extend mid-period
     advance_time(&s.env, 10 * DAY);
     let extended = s
         .client
         .extend_subscription(&s.subscriber, &sub.sub_id);
-    assert_eq!(extended.pay_upfront, true);
+    assert_eq!(extended.auto_renew, true);
 
     // Now process() can charge after current period ends
     s.token
@@ -686,7 +686,7 @@ fn test_process_insufficient_funds() {
     assert_eq!(result.skipped, 0);
 
     let sub = s.client.get_subscription(&s.subscriber, &0);
-    assert_eq!(sub.pay_upfront, false);
+    assert_eq!(sub.auto_renew, false);
 }
 
 #[test]
@@ -760,18 +760,18 @@ fn test_process_trial_expiry_and_first_charge() {
     let sub = s.client.get_subscription(&s.subscriber, &0);
     assert_eq!(sub.next_charge_ts, WEEK + MONTH);
     assert_eq!(sub.service_end_ts, WEEK + MONTH);
-    assert_eq!(sub.pay_upfront, true);
+    assert_eq!(sub.auto_renew, true);
 
     assert_eq!(s.token.balance(&s.subscriber), INITIAL_BALANCE - PRICE);
     assert_eq!(s.token.balance(&s.merchant), PRICE);
 }
 
 #[test]
-fn test_process_skips_no_pay_upfront() {
+fn test_process_skips_no_auto_renew() {
     let s = setup();
     let svc = register_default_service(&s);
 
-    // Subscribe without pay_upfront
+    // Subscribe without auto_renew
     s.client.subscribe(&s.subscriber, &svc.service_id, &false);
 
     advance_time(&s.env, MONTH + 1);

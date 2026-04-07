@@ -81,7 +81,7 @@ pub struct Subscription {
     pub period_secs: u64,
     pub trial_period_secs: u64,
     pub trial_end_ts: u64,
-    pub pay_upfront: bool,
+    pub auto_renew: bool,
     pub service_end_ts: u64,
     pub next_charge_ts: u64,
     pub created_at: u64,
@@ -280,20 +280,20 @@ impl SubscriptionContract {
 
     /// Subscribe to a service.
     ///
-    /// `pay_upfront` controls whether the subscription will auto-renew via
+    /// `auto_renew` controls whether the subscription will auto-renew via
     /// merchant-initiated `process()` calls.
     ///
     /// **With trial period:**
-    /// - `pay_upfront = true`  – approves the contract for `approve_periods`
+    /// - `auto_renew = true`  – approves the contract for `approve_periods`
     ///   future periods; no immediate payment. After the trial, `process()`
     ///   charges each period.
-    /// - `pay_upfront = false` – subscription covers the trial period only;
+    /// - `auto_renew = false` – subscription covers the trial period only;
     ///   no approval, no payment.  Expires when the trial ends.
     ///
     /// **Without trial period:**
-    /// - `pay_upfront = true`  – immediately transfers the first period's price
+    /// - `auto_renew = true`  – immediately transfers the first period's price
     ///   and approves the contract for `approve_periods` future periods.
-    /// - `pay_upfront = false` – immediately transfers the first period's price
+    /// - `auto_renew = false` – immediately transfers the first period's price
     ///   and approves the contract for 1 period.  `process()` will skip this
     ///   subscription, so it expires after the paid period unless extended via
     ///   `extend_subscription`.
@@ -301,7 +301,7 @@ impl SubscriptionContract {
         env: Env,
         subscriber: Address,
         service_id: u64,
-        pay_upfront: bool,
+        auto_renew: bool,
     ) -> Result<Subscription, ContractError> {
         subscriber.require_auth();
 
@@ -321,7 +321,7 @@ impl SubscriptionContract {
         if let Some(existing_sub_id) = env.storage().persistent().get::<_, u64>(&pair_key) {
             let sub_key = DataKey::Sub(existing_sub_id);
             if let Some(existing) = env.storage().persistent().get::<_, Subscription>(&sub_key) {
-                if existing.pay_upfront || env.ledger().timestamp() < existing.service_end_ts {
+                if existing.auto_renew || env.ledger().timestamp() < existing.service_end_ts {
                     return Err(ContractError::AlreadySubscribed);
                 }
             }
@@ -337,8 +337,8 @@ impl SubscriptionContract {
         let sub = if has_trial {
             let trial_end = checked_add_ts(now, service.trial_period_secs)?;
 
-            if pay_upfront {
-                // Trial + pay_upfront: approve for future periods; extra_secs covers the trial
+            if auto_renew {
+                // Trial + auto_renew: approve for future periods; extra_secs covers the trial
                 do_approve(
                     &env,
                     &subscriber,
@@ -355,7 +355,7 @@ impl SubscriptionContract {
                     );
                 }
             }
-            // Trial + !pay_upfront: no approval, no payment – trial only
+            // Trial + !auto_renew: no approval, no payment – trial only
 
             Subscription {
                 sub_id,
@@ -365,7 +365,7 @@ impl SubscriptionContract {
                 period_secs: service.period_secs,
                 trial_period_secs: service.trial_period_secs,
                 trial_end_ts: trial_end,
-                pay_upfront,
+                auto_renew,
                 service_end_ts: trial_end,
                 next_charge_ts: trial_end,
                 created_at: now,
@@ -374,13 +374,13 @@ impl SubscriptionContract {
             let period_end = checked_add_ts(now, service.period_secs)?;
 
             // Approve before transfer so the contract is pre-authorized
-            let periods = if pay_upfront { service.approve_periods } else { 1 };
+            let periods = if auto_renew { service.approve_periods } else { 1 };
             do_approve(&env, &subscriber, &service, periods, 0)?;
 
             // No trial – immediate first payment
             token_client.transfer(&subscriber, &service.merchant, &service.price);
 
-            if pay_upfront {
+            if auto_renew {
                 let balance = token_client.balance(&subscriber);
                 if balance < service.price {
                     env.events().publish(
@@ -398,7 +398,7 @@ impl SubscriptionContract {
                 period_secs: service.period_secs,
                 trial_period_secs: 0,
                 trial_end_ts: 0,
-                pay_upfront,
+                auto_renew,
                 service_end_ts: period_end,
                 next_charge_ts: period_end,
                 created_at: now,
@@ -456,11 +456,11 @@ impl SubscriptionContract {
         if sub.subscriber != subscriber {
             return Err(ContractError::Unauthorized);
         }
-        if !sub.pay_upfront {
+        if !sub.auto_renew {
             return Err(ContractError::AlreadyCancelled);
         }
 
-        sub.pay_upfront = false;
+        sub.auto_renew = false;
         env.storage().persistent().set(&sub_key, &sub);
         bump_persistent(&env, &sub_key);
         bump_instance(&env);
@@ -478,7 +478,7 @@ impl SubscriptionContract {
 
     /// Toggle pay-upfront on or off.  Cannot re-enable on an expired
     /// subscription.
-    pub fn toggle_pay_upfront(
+    pub fn toggle_auto_renew(
         env: Env,
         subscriber: Address,
         sub_id: u64,
@@ -499,14 +499,14 @@ impl SubscriptionContract {
         let now = env.ledger().timestamp();
 
         // Prevent re-enabling on a fully expired subscription
-        if !sub.pay_upfront && now >= sub.service_end_ts {
+        if !sub.auto_renew && now >= sub.service_end_ts {
             return Err(ContractError::SubscriptionExpired);
         }
 
-        sub.pay_upfront = !sub.pay_upfront;
+        sub.auto_renew = !sub.auto_renew;
 
         // If re-enabling, refresh the token approval so process() can charge
-        if sub.pay_upfront {
+        if sub.auto_renew {
             let svc_key = DataKey::Service(sub.service_id);
             let service: Service = env
                 .storage()
@@ -523,16 +523,16 @@ impl SubscriptionContract {
 
         env.events().publish(
             (symbol_short!("renew"),),
-            (subscriber, sub_id, sub.service_id, sub.pay_upfront),
+            (subscriber, sub_id, sub.service_id, sub.auto_renew),
         );
 
-        Ok(sub.pay_upfront)
+        Ok(sub.auto_renew)
     }
 
     /// Extend an active subscription by refreshing the token approval.
     ///
     /// Call this when your allowance is running low and you want the
-    /// subscription to continue renewing.  Sets `pay_upfront` to `true`
+    /// subscription to continue renewing.  Sets `auto_renew` to `true`
     /// and approves the contract for `approve_periods` future periods.
     pub fn extend_subscription(
         env: Env,
@@ -566,7 +566,7 @@ impl SubscriptionContract {
 
         do_approve(&env, &subscriber, &service, service.approve_periods, 0)?;
 
-        sub.pay_upfront = true;
+        sub.auto_renew = true;
         env.storage().persistent().set(&sub_key, &sub);
         bump_persistent(&env, &sub_key);
         bump_instance(&env);
@@ -631,7 +631,7 @@ impl SubscriptionContract {
                 }
             };
 
-            if !sub.pay_upfront {
+            if !sub.auto_renew {
                 skipped += 1;
                 continue;
             }
@@ -692,7 +692,7 @@ impl SubscriptionContract {
                     );
                 }
             } else {
-                sub.pay_upfront = false;
+                sub.auto_renew = false;
                 env.storage().persistent().set(&sub_key, &sub);
                 bump_persistent(&env, &sub_key);
                 failed += 1;

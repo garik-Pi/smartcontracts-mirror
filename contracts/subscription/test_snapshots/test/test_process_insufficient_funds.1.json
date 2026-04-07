@@ -662,6 +662,14 @@
                   "map": [
                     {
                       "key": {
+                        "symbol": "auto_renew"
+                      },
+                      "val": {
+                        "bool": false
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "created_at"
                       },
                       "val": {
@@ -674,14 +682,6 @@
                       },
                       "val": {
                         "u64": 2592000
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "pay_upfront"
-                      },
-                      "val": {
-                        "bool": false
                       }
                     },
                     {
