@@ -310,6 +310,33 @@ fn test_subscribe_with_trial_no_auto_renew() {
 }
 
 #[test]
+fn test_subscribe_trial_abuse_blocked() {
+    let s = setup();
+    let svc = register_trial_service(&s);
+
+    // First trial subscription (no auto_renew)
+    s.client.subscribe(&s.subscriber, &svc.service_id, &false);
+
+    // Wait for trial to expire
+    advance_time(&s.env, WEEK + 1);
+    assert_eq!(
+        s.client
+            .is_subscription_active(&s.subscriber, &svc.service_id),
+        false
+    );
+
+    // Attempt to get another free trial — should be blocked
+    let result = s
+        .client
+        .try_subscribe(&s.subscriber, &svc.service_id, &false);
+    assert_eq!(result, Err(Ok(ContractError::AlreadySubscribed)));
+
+    // But re-subscribing with auto_renew=true should work
+    let sub2 = s.client.subscribe(&s.subscriber, &svc.service_id, &true);
+    assert_eq!(sub2.auto_renew, true);
+}
+
+#[test]
 fn test_subscribe_multiple_services() {
     let s = setup();
     let svc1 = register_default_service(&s);

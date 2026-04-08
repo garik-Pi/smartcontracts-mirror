@@ -311,6 +311,7 @@ impl SubscriptionContract {
             .persistent()
             .get(&svc_key)
             .ok_or(ContractError::ServiceNotFound)?;
+        bump_persistent(&env, &svc_key);
 
         if !service.is_active {
             return Err(ContractError::ServiceNotActive);
@@ -318,13 +319,28 @@ impl SubscriptionContract {
 
         // ---- Dedup check ----
         let pair_key = DataKey::SubServicePair(subscriber.clone(), service_id);
-        if let Some(existing_sub_id) = env.storage().persistent().get::<_, u64>(&pair_key) {
+        let had_trial = if let Some(existing_sub_id) =
+            env.storage().persistent().get::<_, u64>(&pair_key)
+        {
+            bump_persistent(&env, &pair_key);
             let sub_key = DataKey::Sub(existing_sub_id);
             if let Some(existing) = env.storage().persistent().get::<_, Subscription>(&sub_key) {
+                bump_persistent(&env, &sub_key);
                 if existing.auto_renew || env.ledger().timestamp() < existing.service_end_ts {
                     return Err(ContractError::AlreadySubscribed);
                 }
+                existing.trial_period_secs > 0
+            } else {
+                false
             }
+        } else {
+            false
+        };
+
+        // Prevent repeated free trial: if the subscriber already used a trial
+        // for this service, they cannot re-subscribe without auto_renew.
+        if had_trial && !auto_renew && service.trial_period_secs > 0 {
+            return Err(ContractError::AlreadySubscribed);
         }
 
         let now = env.ledger().timestamp();
@@ -476,7 +492,7 @@ impl SubscriptionContract {
         Ok(())
     }
 
-    /// Toggle pay-upfront on or off.  Cannot re-enable on an expired
+    /// Toggle auto-renew on or off.  Cannot re-enable on an expired
     /// subscription.
     pub fn toggle_auto_renew(
         env: Env,
@@ -515,6 +531,7 @@ impl SubscriptionContract {
                 .ok_or(ContractError::ServiceNotFound)?;
 
             do_approve(&env, &subscriber, &service, service.approve_periods, 0)?;
+            bump_persistent(&env, &svc_key);
         }
 
         env.storage().persistent().set(&sub_key, &sub);
@@ -569,6 +586,7 @@ impl SubscriptionContract {
         sub.auto_renew = true;
         env.storage().persistent().set(&sub_key, &sub);
         bump_persistent(&env, &sub_key);
+        bump_persistent(&env, &svc_key);
         bump_instance(&env);
 
         env.events().publish(
@@ -598,6 +616,7 @@ impl SubscriptionContract {
         if service.merchant != merchant {
             return Err(ContractError::NotServiceOwner);
         }
+        bump_persistent(&env, &svc_key);
 
         let token = get_token(&env);
         let token_client = TokenClient::new(&env, &token);
@@ -605,14 +624,16 @@ impl SubscriptionContract {
         let now = env.ledger().timestamp();
 
         let svc_subs_key = DataKey::ServiceSubs(service_id);
-        let sub_ids: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&svc_subs_key)
-            .unwrap_or_else(|| Vec::new(&env));
+        let sub_ids: Vec<u64> = match env.storage().persistent().get(&svc_subs_key) {
+            Some(ids) => {
+                bump_persistent(&env, &svc_subs_key);
+                ids
+            }
+            None => Vec::new(&env),
+        };
 
         let total = sub_ids.len();
-        let start = (offset as u32).min(total);
+        let start = offset.min(total);
         let end = start.saturating_add(limit).min(total);
 
         let mut charged: u32 = 0;
@@ -653,7 +674,21 @@ impl SubscriptionContract {
                 let was_trial = sub.trial_period_secs > 0
                     && sub.next_charge_ts == sub.trial_end_ts;
 
-                let new_next = checked_add_ts(sub.next_charge_ts, sub.period_secs)?;
+                let new_next = match sub.next_charge_ts.checked_add(sub.period_secs) {
+                    Some(ts) => ts,
+                    None => {
+                        // Overflow: disable auto-renew rather than reverting the batch
+                        sub.auto_renew = false;
+                        env.storage().persistent().set(&sub_key, &sub);
+                        bump_persistent(&env, &sub_key);
+                        failed += 1;
+                        env.events().publish(
+                            (symbol_short!("chg_fail"),),
+                            (sub.subscriber.clone(), service_id, sub.sub_id),
+                        );
+                        continue;
+                    }
+                };
                 sub.next_charge_ts = new_next;
                 sub.service_end_ts = new_next;
                 env.storage().persistent().set(&sub_key, &sub);
@@ -729,7 +764,6 @@ impl SubscriptionContract {
             .persistent()
             .get(&sub_key)
             .ok_or(ContractError::SubscriptionNotFound)?;
-        bump_persistent(&env, &sub_key);
 
         if caller != sub.subscriber {
             let svc_key = DataKey::Service(sub.service_id);
@@ -738,7 +772,6 @@ impl SubscriptionContract {
                 .persistent()
                 .get(&svc_key)
                 .ok_or(ContractError::ServiceNotFound)?;
-            bump_persistent(&env, &svc_key);
             if caller != service.merchant {
                 return Err(ContractError::Unauthorized);
             }
@@ -756,14 +789,12 @@ impl SubscriptionContract {
             .persistent()
             .get(&ss_key)
             .unwrap_or_else(|| Vec::new(&env));
-        bump_persistent(&env, &ss_key);
 
         let mut result: Vec<Subscription> = Vec::new(&env);
         for i in 0..sub_ids.len() {
             let sid = sub_ids.get(i).unwrap();
-            let sub_key = DataKey::Sub(sid);
-            if let Some(sub) = env.storage().persistent().get::<_, Subscription>(&sub_key) {
-                bump_persistent(&env, &sub_key);
+            if let Some(sub) = env.storage().persistent().get::<_, Subscription>(&DataKey::Sub(sid))
+            {
                 result.push_back(sub);
             }
         }
@@ -794,14 +825,13 @@ impl SubscriptionContract {
             .persistent()
             .get(&svc_subs_key)
             .unwrap_or_else(|| Vec::new(&env));
-        bump_persistent(&env, &svc_subs_key);
 
         let mut result: Vec<Subscription> = Vec::new(&env);
         for i in 0..sub_ids.len() {
             let sid = sub_ids.get(i).unwrap();
-            let sub_key = DataKey::Sub(sid);
-            if let Some(sub) = env.storage().persistent().get::<_, Subscription>(&sub_key) {
-                bump_persistent(&env, &sub_key);
+            if let Some(sub) =
+                env.storage().persistent().get::<_, Subscription>(&DataKey::Sub(sid))
+            {
                 result.push_back(sub);
             }
         }
@@ -810,13 +840,10 @@ impl SubscriptionContract {
 
     pub fn get_service(env: Env, service_id: u64) -> Result<Service, ContractError> {
         let svc_key = DataKey::Service(service_id);
-        let service: Service = env
-            .storage()
+        env.storage()
             .persistent()
             .get(&svc_key)
-            .ok_or(ContractError::ServiceNotFound)?;
-        bump_persistent(&env, &svc_key);
-        Ok(service)
+            .ok_or(ContractError::ServiceNotFound)
     }
 
     pub fn get_merchant_services(env: Env, merchant: Address) -> Vec<Service> {
@@ -826,14 +853,13 @@ impl SubscriptionContract {
             .persistent()
             .get(&ms_key)
             .unwrap_or_else(|| Vec::new(&env));
-        bump_persistent(&env, &ms_key);
 
         let mut result: Vec<Service> = Vec::new(&env);
         for i in 0..svc_ids.len() {
             let sid = svc_ids.get(i).unwrap();
-            let svc_key = DataKey::Service(sid);
-            if let Some(svc) = env.storage().persistent().get::<_, Service>(&svc_key) {
-                bump_persistent(&env, &svc_key);
+            if let Some(svc) =
+                env.storage().persistent().get::<_, Service>(&DataKey::Service(sid))
+            {
                 result.push_back(svc);
             }
         }
@@ -846,13 +872,14 @@ impl SubscriptionContract {
             Some(id) => id,
             None => return false,
         };
-        bump_persistent(&env, &pair_key);
-        let sub_key = DataKey::Sub(sub_id);
-        let sub: Subscription = match env.storage().persistent().get(&sub_key) {
+        let sub: Subscription = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::Sub(sub_id))
+        {
             Some(s) => s,
             None => return false,
         };
-        bump_persistent(&env, &sub_key);
         env.ledger().timestamp() < sub.service_end_ts
     }
 
