@@ -11,7 +11,8 @@ use soroban_sdk::{
 const INSTANCE_TTL_THRESHOLD: u32 = 17_280; // ~1 day
 const INSTANCE_TTL_EXTEND: u32 = 518_400; // ~30 days
 const PERSISTENT_TTL_THRESHOLD: u32 = 17_280;
-const PERSISTENT_TTL_EXTEND: u32 = 518_400;
+const PERSISTENT_TTL_EXTEND_MIN: u32 = 518_400; // ~30 days floor
+const SECS_PER_LEDGER: u64 = 5;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -111,10 +112,23 @@ fn bump_instance(env: &Env) {
         .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND);
 }
 
-fn bump_persistent(env: &Env, key: &DataKey) {
-    env.storage()
-        .persistent()
-        .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_EXTEND);
+/// Compute TTL extend: max(period_secs * 2 / SECS_PER_LEDGER, MIN_FLOOR)
+fn ttl_extend_for_period(period_secs: u64) -> u32 {
+    let ledgers = period_secs.saturating_mul(2) / SECS_PER_LEDGER;
+    let capped = if ledgers > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        ledgers as u32
+    };
+    core::cmp::max(capped, PERSISTENT_TTL_EXTEND_MIN)
+}
+
+fn bump_persistent(env: &Env, key: &DataKey, period_secs: u64) {
+    env.storage().persistent().extend_ttl(
+        key,
+        PERSISTENT_TTL_THRESHOLD,
+        ttl_extend_for_period(period_secs),
+    );
 }
 
 fn next_service_id(env: &Env) -> u64 {
@@ -255,7 +269,7 @@ impl SubscriptionContract {
 
         let svc_key = DataKey::Service(service_id);
         env.storage().persistent().set(&svc_key, &service);
-        bump_persistent(&env, &svc_key);
+        bump_persistent(&env, &svc_key, period_secs);
 
         // Append to merchant's service list
         let ms_key = DataKey::MerchantServices(merchant);
@@ -266,7 +280,7 @@ impl SubscriptionContract {
             .unwrap_or_else(|| Vec::new(&env));
         svc_ids.push_back(service_id);
         env.storage().persistent().set(&ms_key, &svc_ids);
-        bump_persistent(&env, &ms_key);
+        bump_persistent(&env, &ms_key, period_secs);
 
         bump_instance(&env);
 
@@ -311,7 +325,7 @@ impl SubscriptionContract {
             .persistent()
             .get(&svc_key)
             .ok_or(ContractError::ServiceNotFound)?;
-        bump_persistent(&env, &svc_key);
+        bump_persistent(&env, &svc_key, service.period_secs);
 
         if !service.is_active {
             return Err(ContractError::ServiceNotActive);
@@ -322,10 +336,10 @@ impl SubscriptionContract {
         let had_trial = if let Some(existing_sub_id) =
             env.storage().persistent().get::<_, u64>(&pair_key)
         {
-            bump_persistent(&env, &pair_key);
+            bump_persistent(&env, &pair_key, service.period_secs);
             let sub_key = DataKey::Sub(existing_sub_id);
             if let Some(existing) = env.storage().persistent().get::<_, Subscription>(&sub_key) {
-                bump_persistent(&env, &sub_key);
+                bump_persistent(&env, &sub_key, existing.period_secs);
                 if existing.auto_renew || env.ledger().timestamp() < existing.service_end_ts {
                     return Err(ContractError::AlreadySubscribed);
                 }
@@ -422,12 +436,13 @@ impl SubscriptionContract {
         };
 
         // ---- Persist subscription ----
+        let ps = service.period_secs;
         let sub_key = DataKey::Sub(sub_id);
         env.storage().persistent().set(&sub_key, &sub);
-        bump_persistent(&env, &sub_key);
+        bump_persistent(&env, &sub_key, ps);
 
         env.storage().persistent().set(&pair_key, &sub_id);
-        bump_persistent(&env, &pair_key);
+        bump_persistent(&env, &pair_key, ps);
 
         // Append to subscriber's list
         let ss_key = DataKey::SubscriberSubs(subscriber.clone());
@@ -438,7 +453,7 @@ impl SubscriptionContract {
             .unwrap_or_else(|| Vec::new(&env));
         sub_ids.push_back(sub_id);
         env.storage().persistent().set(&ss_key, &sub_ids);
-        bump_persistent(&env, &ss_key);
+        bump_persistent(&env, &ss_key, ps);
 
         // Append to service's subscriber list
         let svc_subs_key = DataKey::ServiceSubs(service_id);
@@ -449,7 +464,7 @@ impl SubscriptionContract {
             .unwrap_or_else(|| Vec::new(&env));
         svc_sub_ids.push_back(sub_id);
         env.storage().persistent().set(&svc_subs_key, &svc_sub_ids);
-        bump_persistent(&env, &svc_subs_key);
+        bump_persistent(&env, &svc_subs_key, ps);
 
         bump_instance(&env);
 
@@ -478,7 +493,7 @@ impl SubscriptionContract {
 
         sub.auto_renew = false;
         env.storage().persistent().set(&sub_key, &sub);
-        bump_persistent(&env, &sub_key);
+        bump_persistent(&env, &sub_key, sub.period_secs);
         bump_instance(&env);
 
         let now = env.ledger().timestamp();
@@ -531,11 +546,11 @@ impl SubscriptionContract {
                 .ok_or(ContractError::ServiceNotFound)?;
 
             do_approve(&env, &subscriber, &service, service.approve_periods, 0)?;
-            bump_persistent(&env, &svc_key);
+            bump_persistent(&env, &svc_key, sub.period_secs);
         }
 
         env.storage().persistent().set(&sub_key, &sub);
-        bump_persistent(&env, &sub_key);
+        bump_persistent(&env, &sub_key, sub.period_secs);
         bump_instance(&env);
 
         env.events().publish(
@@ -585,8 +600,8 @@ impl SubscriptionContract {
 
         sub.auto_renew = true;
         env.storage().persistent().set(&sub_key, &sub);
-        bump_persistent(&env, &sub_key);
-        bump_persistent(&env, &svc_key);
+        bump_persistent(&env, &sub_key, sub.period_secs);
+        bump_persistent(&env, &svc_key, sub.period_secs);
         bump_instance(&env);
 
         env.events().publish(
@@ -616,7 +631,7 @@ impl SubscriptionContract {
         if service.merchant != merchant {
             return Err(ContractError::NotServiceOwner);
         }
-        bump_persistent(&env, &svc_key);
+        bump_persistent(&env, &svc_key, service.period_secs);
 
         let token = get_token(&env);
         let token_client = TokenClient::new(&env, &token);
@@ -626,7 +641,7 @@ impl SubscriptionContract {
         let svc_subs_key = DataKey::ServiceSubs(service_id);
         let sub_ids: Vec<u64> = match env.storage().persistent().get(&svc_subs_key) {
             Some(ids) => {
-                bump_persistent(&env, &svc_subs_key);
+                bump_persistent(&env, &svc_subs_key, service.period_secs);
                 ids
             }
             None => Vec::new(&env),
@@ -680,7 +695,7 @@ impl SubscriptionContract {
                         // Overflow: disable auto-renew rather than reverting the batch
                         sub.auto_renew = false;
                         env.storage().persistent().set(&sub_key, &sub);
-                        bump_persistent(&env, &sub_key);
+                        bump_persistent(&env, &sub_key, sub.period_secs);
                         failed += 1;
                         env.events().publish(
                             (symbol_short!("chg_fail"),),
@@ -692,7 +707,7 @@ impl SubscriptionContract {
                 sub.next_charge_ts = new_next;
                 sub.service_end_ts = new_next;
                 env.storage().persistent().set(&sub_key, &sub);
-                bump_persistent(&env, &sub_key);
+                bump_persistent(&env, &sub_key, sub.period_secs);
                 charged += 1;
 
                 env.events().publish(
@@ -729,7 +744,7 @@ impl SubscriptionContract {
             } else {
                 sub.auto_renew = false;
                 env.storage().persistent().set(&sub_key, &sub);
-                bump_persistent(&env, &sub_key);
+                bump_persistent(&env, &sub_key, sub.period_secs);
                 failed += 1;
 
                 env.events().publish(
