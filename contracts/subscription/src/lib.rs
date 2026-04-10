@@ -188,7 +188,13 @@ fn do_approve(
     };
     let max_ttl = env.storage().max_ttl().saturating_sub(1);
     let capped_ledgers = core::cmp::min(capped_ledgers, max_ttl);
-    let expiration_ledger = env.ledger().sequence().saturating_add(capped_ledgers);
+    // Round down to a stable bucket so the value is identical between simulate and execute.
+    // 720 ledgers ≈ 1 hour — much larger than the simulate→execute gap (~seconds).
+    const LEDGER_BUCKET: u32 = 720;
+    let raw_expiration = env.ledger().sequence().saturating_add(capped_ledgers);
+    let max_expiration = env.ledger().sequence().saturating_add(max_ttl);
+    let capped = core::cmp::min(raw_expiration, max_expiration);
+    let expiration_ledger = (capped / LEDGER_BUCKET) * LEDGER_BUCKET;
 
     token_client.approve(
         subscriber,
