@@ -53,6 +53,7 @@ pub enum DataKey {
     SubscriberSubs(Address),
     ServiceSubs(u64),
     SubServicePair(Address, u64),
+    TrialUsed(Address, u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -303,14 +304,19 @@ impl SubscriptionContract {
     /// `auto_renew` controls whether the subscription will auto-renew via
     /// merchant-initiated `process()` calls.
     ///
-    /// **With trial period:**
+    /// A trial is granted only on the subscriber's first subscription to a
+    /// service that has `trial_period_secs > 0`. Trial consumption is recorded
+    /// independently of `auto_renew` and persists across `cancel()` /
+    /// re-subscription, so the one-trial policy cannot be bypassed.
+    ///
+    /// **First subscription to a service with a trial:**
     /// - `auto_renew = true`  – approves the contract for `approve_periods`
     ///   future periods; no immediate payment. After the trial, `process()`
     ///   charges each period.
     /// - `auto_renew = false` – subscription covers the trial period only;
     ///   no approval, no payment.  Expires when the trial ends.
     ///
-    /// **Without trial period:**
+    /// **Re-subscription after trial, or service without a trial:**
     /// - `auto_renew = true`  – immediately transfers the first period's price
     ///   and approves the contract for `approve_periods` future periods.
     /// - `auto_renew = false` – immediately transfers the first period's price
@@ -337,11 +343,16 @@ impl SubscriptionContract {
             return Err(ContractError::ServiceNotActive);
         }
 
+        // ---- Trial-consumption flag (independent of auto_renew / cancel) ----
+        let trial_used_key = DataKey::TrialUsed(subscriber.clone(), service_id);
+        let mut had_trial = env.storage().persistent().has(&trial_used_key);
+        if had_trial {
+            bump_persistent(&env, &trial_used_key, service.period_secs);
+        }
+
         // ---- Dedup check ----
         let pair_key = DataKey::SubServicePair(subscriber.clone(), service_id);
-        let had_trial = if let Some(existing_sub_id) =
-            env.storage().persistent().get::<_, u64>(&pair_key)
-        {
+        if let Some(existing_sub_id) = env.storage().persistent().get::<_, u64>(&pair_key) {
             bump_persistent(&env, &pair_key, service.period_secs);
             let sub_key = DataKey::Sub(existing_sub_id);
             if let Some(existing) = env.storage().persistent().get::<_, Subscription>(&sub_key) {
@@ -349,18 +360,12 @@ impl SubscriptionContract {
                 if existing.auto_renew || env.ledger().timestamp() < existing.service_end_ts {
                     return Err(ContractError::AlreadySubscribed);
                 }
-                existing.trial_period_secs > 0
-            } else {
-                false
+                // Legacy migration: pre-fix subscriptions never set TrialUsed,
+                // so derive it from the prior subscription's trial_period_secs.
+                if existing.trial_period_secs > 0 {
+                    had_trial = true;
+                }
             }
-        } else {
-            false
-        };
-
-        // Prevent repeated free trial: if the subscriber already used a trial
-        // for this service, they cannot re-subscribe without auto_renew.
-        if had_trial && !auto_renew && service.trial_period_secs > 0 {
-            return Err(ContractError::AlreadySubscribed);
         }
 
         let now = env.ledger().timestamp();
@@ -368,10 +373,15 @@ impl SubscriptionContract {
         let token = get_token(&env);
         let token_client = TokenClient::new(&env, &token);
 
-        let has_trial = service.trial_period_secs > 0;
+        let grant_trial = service.trial_period_secs > 0 && !had_trial;
 
-        let sub = if has_trial {
+        let sub = if grant_trial {
             let trial_end = checked_add_ts(now, service.trial_period_secs)?;
+
+            // Mark trial as consumed before any external calls so the flag
+            // sticks regardless of subsequent cancel() or allowance revocation.
+            env.storage().persistent().set(&trial_used_key, &true);
+            bump_persistent(&env, &trial_used_key, service.period_secs);
 
             if auto_renew {
                 // Trial + auto_renew: approve for future periods; extra_secs covers the trial
