@@ -1108,6 +1108,85 @@ fn test_resubscribe_prunes_stale_index_entries() {
     assert_eq!(subscriber_subs.len(), 1);
 }
 
+// ===========================================================================
+// Allowance revocation (LIB-8: cancel/toggle clear the on-chain allowance)
+// ===========================================================================
+
+#[test]
+fn test_cancel_revokes_allowance_for_single_sub() {
+    let s = setup();
+    let svc = register_default_service(&s);
+    let sub = s.client.subscribe(&s.subscriber, &svc.service_id, &true);
+
+    // Subscribe with auto_renew=true approves the contract for future periods.
+    let allowance_before = s.token.allowance(&s.subscriber, &s.contract_addr);
+    assert!(allowance_before > 0);
+
+    s.client.cancel(&s.subscriber, &sub.sub_id);
+
+    // Cancellation must zero out the allowance — this is the cancellation
+    // boundary on chain.
+    let allowance_after = s.token.allowance(&s.subscriber, &s.contract_addr);
+    assert_eq!(allowance_after, 0);
+}
+
+#[test]
+fn test_cancel_preserves_allowance_when_other_sub_active() {
+    // Allowance is per (subscriber, contract), not per service. If we revoked
+    // unconditionally, cancelling one sub would also tear down billing for
+    // the user's other live subscriptions in this contract.
+    let s = setup();
+    let svc1 = register_default_service(&s);
+    let svc2 = s.client.register_service(
+        &s.merchant2,
+        &String::from_str(&s.env, "Other Plan"),
+        &500,
+        &WEEK,
+        &0,
+        &12,
+    );
+
+    let sub1 = s.client.subscribe(&s.subscriber, &svc1.service_id, &true);
+    let _sub2 = s.client.subscribe(&s.subscriber, &svc2.service_id, &true);
+
+    let allowance_after_both = s.token.allowance(&s.subscriber, &s.contract_addr);
+    assert!(allowance_after_both > 0);
+
+    s.client.cancel(&s.subscriber, &sub1.sub_id);
+
+    // sub2 is still auto-renewing, so the allowance must survive.
+    let allowance_after_cancel = s.token.allowance(&s.subscriber, &s.contract_addr);
+    assert_eq!(allowance_after_cancel, allowance_after_both);
+}
+
+#[test]
+fn test_toggle_auto_renew_off_revokes_allowance() {
+    let s = setup();
+    let svc = register_default_service(&s);
+    let sub = s.client.subscribe(&s.subscriber, &svc.service_id, &true);
+
+    let new_state = s.client.toggle_auto_renew(&s.subscriber, &sub.sub_id);
+    assert_eq!(new_state, false);
+
+    let allowance = s.token.allowance(&s.subscriber, &s.contract_addr);
+    assert_eq!(allowance, 0);
+}
+
+#[test]
+fn test_toggle_auto_renew_back_on_restores_allowance() {
+    // Toggle off -> revokes; toggle on -> the existing re-approve path
+    // refreshes the allowance, so the user can resume billing.
+    let s = setup();
+    let svc = register_default_service(&s);
+    let sub = s.client.subscribe(&s.subscriber, &svc.service_id, &true);
+
+    s.client.toggle_auto_renew(&s.subscriber, &sub.sub_id);
+    assert_eq!(s.token.allowance(&s.subscriber, &s.contract_addr), 0);
+
+    s.client.toggle_auto_renew(&s.subscriber, &sub.sub_id);
+    assert!(s.token.allowance(&s.subscriber, &s.contract_addr) > 0);
+}
+
 #[test]
 fn test_resubscribe_cross_page_swap_updates_reverse_pointer() {
     // When pruning a sub from a non-tail page, the global tail is moved
