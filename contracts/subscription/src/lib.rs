@@ -211,12 +211,27 @@ fn do_approve(
     // The user's revoke path (cancel / toggle off) already clears this in
     // a tight cancellation boundary, so the wider window is bounded by
     // the user's explicit lifecycle, not by max_ttl alone.
-    let max_ttl = env.storage().max_ttl().saturating_sub(1);
-    // Round down to a stable bucket so the value is identical between simulate and execute.
+    let max_ttl = env.storage().max_ttl();
+    let seq = env.ledger().sequence();
     // 720 ledgers ≈ 1 hour — much larger than the simulate→execute gap (~seconds).
     const LEDGER_BUCKET: u32 = 720;
-    let raw_expiration = env.ledger().sequence().saturating_add(max_ttl);
-    let expiration_ledger = (raw_expiration / LEDGER_BUCKET) * LEDGER_BUCKET;
+    // LIB-10: round expiration UP to a bucket boundary, never down. The old
+    // floor could move expiration backward by up to LEDGER_BUCKET-1 ledgers
+    // and, with a short approval window, land at or before `seq` — writing
+    // an already-expired allowance. Aim for `max_ttl - LEDGER_BUCKET` so the
+    // upward rounding has room to grow without exceeding the SAC's
+    // `live_until - seq <= max_ttl` cap.
+    let expiration_ledger = if max_ttl <= LEDGER_BUCKET {
+        // Pathological: network max_ttl smaller than one bucket. Skip
+        // bucket rounding and use a direct value within SAC's limit.
+        seq.saturating_add(max_ttl.saturating_sub(1))
+    } else {
+        let target = seq.saturating_add(max_ttl - LEDGER_BUCKET);
+        target
+            .saturating_add(LEDGER_BUCKET - 1)
+            / LEDGER_BUCKET
+            * LEDGER_BUCKET
+    };
 
     token_client.approve(
         subscriber,
