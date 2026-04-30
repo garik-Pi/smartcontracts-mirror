@@ -314,8 +314,9 @@ fn test_subscribe_trial_abuse_blocked() {
     let s = setup();
     let svc = register_trial_service(&s);
 
-    // First trial subscription (no auto_renew)
+    // First trial subscription (no auto_renew) — free trial, no charge
     s.client.subscribe(&s.subscriber, &svc.service_id, &false);
+    assert_eq!(s.token.balance(&s.subscriber), INITIAL_BALANCE);
 
     // Wait for trial to expire
     advance_time(&s.env, WEEK + 1);
@@ -325,15 +326,40 @@ fn test_subscribe_trial_abuse_blocked() {
         false
     );
 
-    // Attempt to get another free trial — should be blocked
-    let result = s
-        .client
-        .try_subscribe(&s.subscriber, &svc.service_id, &false);
-    assert_eq!(result, Err(Ok(ContractError::AlreadySubscribed)));
+    // Re-subscribing without auto_renew is allowed but no second trial:
+    // contract takes the paid path and charges immediately.
+    let sub2 = s.client.subscribe(&s.subscriber, &svc.service_id, &false);
+    assert_eq!(sub2.trial_period_secs, 0);
+    assert_eq!(sub2.trial_end_ts, 0);
+    assert_eq!(s.token.balance(&s.subscriber), INITIAL_BALANCE - PRICE);
+}
 
-    // But re-subscribing with auto_renew=true should work
+#[test]
+fn test_subscribe_trial_abuse_blocked_via_auto_renew_cycle() {
+    // LIB-5 regression: subscribe(true) → cancel during trial → wait for
+    // expiry → subscribe(true) used to grant a fresh trial because the
+    // had_trial guard only fired when auto_renew was false. After the fix
+    // the second subscription must take the paid path.
+    let s = setup();
+    let svc = register_trial_service(&s);
+
+    let sub1 = s.client.subscribe(&s.subscriber, &svc.service_id, &true);
+    assert_eq!(sub1.trial_period_secs, WEEK);
+
+    // Cancel during the trial — keeps trial active but disables auto-renew
+    s.client.cancel(&s.subscriber, &sub1.sub_id);
+
+    // Trial expires
+    advance_time(&s.env, WEEK + 1);
+
+    // Second subscribe with auto_renew=true must NOT grant another trial
     let sub2 = s.client.subscribe(&s.subscriber, &svc.service_id, &true);
     assert_eq!(sub2.auto_renew, true);
+    assert_eq!(sub2.trial_period_secs, 0);
+    assert_eq!(sub2.trial_end_ts, 0);
+
+    // Paid path: first period charged immediately
+    assert_eq!(s.token.balance(&s.subscriber), INITIAL_BALANCE - PRICE);
 }
 
 #[test]
