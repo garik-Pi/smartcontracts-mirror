@@ -14,6 +14,10 @@ const PERSISTENT_TTL_THRESHOLD: u32 = 17_280;
 const PERSISTENT_TTL_EXTEND_MIN: u32 = 518_400; // ~30 days floor
 const SECS_PER_LEDGER: u64 = 5;
 
+// Max entries per index page. Bounded so a single read/write touches a
+// constant-sized entry instead of the full historical set.
+const PAGE_SIZE: u32 = 50;
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -48,12 +52,21 @@ pub enum DataKey {
     NextSubId,
     // Persistent storage
     Service(u64),
-    MerchantServices(Address),
     Sub(u64),
-    SubscriberSubs(Address),
-    ServiceSubs(u64),
     SubServicePair(Address, u64),
     TrialUsed(Address, u64),
+    // Paginated indexes: each *Page key holds at most PAGE_SIZE entries; the
+    // companion *Count key tracks total live entries (sum of all pages).
+    MerchantServicesPage(Address, u32),
+    MerchantServicesCount(Address),
+    SubscriberSubsPage(Address, u32),
+    SubscriberSubsCount(Address),
+    ServiceSubsPage(u64, u32),
+    ServiceSubsCount(u64),
+    // Reverse pointer: per-sub_id, the page index it occupies in
+    // ServiceSubs/SubscriberSubs. Lets cancel/re-subscribe locate and
+    // remove the entry without scanning every page.
+    SubIndex(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -96,6 +109,13 @@ pub struct ProcessResult {
     pub failed: u32,
     pub skipped: u32,
     pub total: u32,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+#[contracttype]
+pub struct SubIndex {
+    pub service_page: u32,
+    pub subscriber_page: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +239,155 @@ fn do_approve(
 }
 
 // ---------------------------------------------------------------------------
+// Paginated index helpers
+// ---------------------------------------------------------------------------
+//
+// An index is split across pages of at most PAGE_SIZE entries. Pages 0..tail-1
+// are always full; only the tail page is partial. Removal uses swap-with-
+// global-tail to keep this invariant, so the caller may need to update the
+// reverse pointer of whichever element is moved into the removed slot.
+
+/// Append `item` to a paginated index. Returns the page index it was placed on.
+fn paginated_append<F>(
+    env: &Env,
+    page_key_fn: F,
+    count_key: &DataKey,
+    item: u64,
+    period_secs: u64,
+) -> u32
+where
+    F: Fn(u32) -> DataKey,
+{
+    let count: u64 = env.storage().persistent().get(count_key).unwrap_or(0);
+    let page_idx = (count / PAGE_SIZE as u64) as u32;
+    let page_key = page_key_fn(page_idx);
+    let mut page: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&page_key)
+        .unwrap_or_else(|| Vec::new(env));
+    page.push_back(item);
+    env.storage().persistent().set(&page_key, &page);
+    bump_persistent(env, &page_key, period_secs);
+    env.storage().persistent().set(count_key, &(count + 1));
+    bump_persistent(env, count_key, period_secs);
+    page_idx
+}
+
+/// Remove `target` from `target_page`, swapping in the global tail to keep
+/// pages dense. Returns Some((moved_id, new_page_idx)) when a different
+/// element was relocated into the removed slot — the caller must update its
+/// reverse pointer. Returns None if no relocation was needed (target was the
+/// global tail) or target wasn't found.
+fn paginated_remove<F>(
+    env: &Env,
+    page_key_fn: F,
+    count_key: &DataKey,
+    target: u64,
+    target_page: u32,
+    period_secs: u64,
+) -> Option<(u64, u32)>
+where
+    F: Fn(u32) -> DataKey,
+{
+    let target_page_key = page_key_fn(target_page);
+    let mut target_page_vec: Vec<u64> = match env.storage().persistent().get(&target_page_key) {
+        Some(v) => v,
+        None => return None,
+    };
+
+    let mut target_idx_opt: Option<u32> = None;
+    for i in 0..target_page_vec.len() {
+        if target_page_vec.get(i).unwrap() == target {
+            target_idx_opt = Some(i);
+            break;
+        }
+    }
+    let target_idx = match target_idx_opt {
+        Some(i) => i,
+        None => return None,
+    };
+
+    let count: u64 = env.storage().persistent().get(count_key).unwrap_or(0);
+    if count == 0 {
+        return None;
+    }
+    let last_page_idx = ((count - 1) / PAGE_SIZE as u64) as u32;
+
+    let moved: Option<(u64, u32)> = if last_page_idx == target_page {
+        // Target lives on the last page; swap-and-pop within this page only.
+        let last_idx = target_page_vec.len() - 1;
+        if target_idx != last_idx {
+            let last_item = target_page_vec.get(last_idx).unwrap();
+            target_page_vec.set(target_idx, last_item);
+        }
+        target_page_vec.pop_back();
+        if target_page_vec.is_empty() {
+            env.storage().persistent().remove(&target_page_key);
+        } else {
+            env.storage().persistent().set(&target_page_key, &target_page_vec);
+            bump_persistent(env, &target_page_key, period_secs);
+        }
+        // Movement was within the same page, so reverse pointer is unchanged.
+        None
+    } else {
+        // Target is on an earlier page; relocate the global tail into its slot.
+        let last_page_key = page_key_fn(last_page_idx);
+        let mut last_page_vec: Vec<u64> =
+            env.storage().persistent().get(&last_page_key).unwrap();
+        let last_item_idx = last_page_vec.len() - 1;
+        let last_item = last_page_vec.get(last_item_idx).unwrap();
+
+        target_page_vec.set(target_idx, last_item);
+        env.storage().persistent().set(&target_page_key, &target_page_vec);
+        bump_persistent(env, &target_page_key, period_secs);
+
+        last_page_vec.pop_back();
+        if last_page_vec.is_empty() {
+            env.storage().persistent().remove(&last_page_key);
+        } else {
+            env.storage().persistent().set(&last_page_key, &last_page_vec);
+            bump_persistent(env, &last_page_key, period_secs);
+        }
+
+        Some((last_item, target_page))
+    };
+
+    env.storage().persistent().set(count_key, &(count - 1));
+    bump_persistent(env, count_key, period_secs);
+
+    moved
+}
+
+/// Read a paginated index in full. Returns the concatenated contents of all
+/// pages in append order. Each page is loaded as a separate persistent entry,
+/// so total work is O(n) but no single read needs to fit the entire history
+/// in one entry.
+fn paginated_read_all<F>(env: &Env, page_key_fn: F, count_key: &DataKey) -> Vec<u64>
+where
+    F: Fn(u32) -> DataKey,
+{
+    let count: u64 = env.storage().persistent().get(count_key).unwrap_or(0);
+    let mut out: Vec<u64> = Vec::new(env);
+    if count == 0 {
+        return out;
+    }
+    let last_page_idx = ((count - 1) / PAGE_SIZE as u64) as u32;
+    for p in 0..=last_page_idx {
+        if let Some(page) = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<u64>>(&page_key_fn(p))
+        {
+            for i in 0..page.len() {
+                out.push_back(page.get(i).unwrap());
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
 #[contractimpl]
@@ -278,16 +447,16 @@ impl SubscriptionContract {
         env.storage().persistent().set(&svc_key, &service);
         bump_persistent(&env, &svc_key, period_secs);
 
-        // Append to merchant's service list
-        let ms_key = DataKey::MerchantServices(merchant);
-        let mut svc_ids: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&ms_key)
-            .unwrap_or_else(|| Vec::new(&env));
-        svc_ids.push_back(service_id);
-        env.storage().persistent().set(&ms_key, &svc_ids);
-        bump_persistent(&env, &ms_key, period_secs);
+        // Append to merchant's paginated service index
+        let merchant_for_pages = merchant.clone();
+        let count_key = DataKey::MerchantServicesCount(merchant);
+        paginated_append(
+            &env,
+            |p| DataKey::MerchantServicesPage(merchant_for_pages.clone(), p),
+            &count_key,
+            service_id,
+            period_secs,
+        );
 
         bump_instance(&env);
 
@@ -351,7 +520,12 @@ impl SubscriptionContract {
         }
 
         // ---- Dedup check ----
+        // If a prior subscription exists and is fully dead (auto_renew=false
+        // AND past service_end_ts), we'll prune its index entries below
+        // before adding the new sub_id, so the indexes don't grow on each
+        // re-subscribe cycle.
         let pair_key = DataKey::SubServicePair(subscriber.clone(), service_id);
+        let mut prior_sub_to_prune: Option<u64> = None;
         if let Some(existing_sub_id) = env.storage().persistent().get::<_, u64>(&pair_key) {
             bump_persistent(&env, &pair_key, service.period_secs);
             let sub_key = DataKey::Sub(existing_sub_id);
@@ -365,6 +539,7 @@ impl SubscriptionContract {
                 if existing.trial_period_secs > 0 {
                     had_trial = true;
                 }
+                prior_sub_to_prune = Some(existing_sub_id);
             }
         }
 
@@ -460,27 +635,90 @@ impl SubscriptionContract {
         env.storage().persistent().set(&pair_key, &sub_id);
         bump_persistent(&env, &pair_key, ps);
 
-        // Append to subscriber's list
-        let ss_key = DataKey::SubscriberSubs(subscriber.clone());
-        let mut sub_ids: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&ss_key)
-            .unwrap_or_else(|| Vec::new(&env));
-        sub_ids.push_back(sub_id);
-        env.storage().persistent().set(&ss_key, &sub_ids);
-        bump_persistent(&env, &ss_key, ps);
+        // Prune the dead prior sub_id from the indexes before appending the
+        // new one. Without this, every re-subscribe cycle would leave a
+        // permanently-stale entry behind and the indexes would grow without
+        // bound. Reverse-pointer (SubIndex) for the prior sub tells us which
+        // page to touch — O(1) per index, not a full scan.
+        if let Some(old_sub_id) = prior_sub_to_prune {
+            let idx_key = DataKey::SubIndex(old_sub_id);
+            if let Some(old_idx) = env.storage().persistent().get::<_, SubIndex>(&idx_key) {
+                let svc_id_for_pages = service_id;
+                let moved_in_service = paginated_remove(
+                    &env,
+                    |p| DataKey::ServiceSubsPage(svc_id_for_pages, p),
+                    &DataKey::ServiceSubsCount(svc_id_for_pages),
+                    old_sub_id,
+                    old_idx.service_page,
+                    ps,
+                );
+                if let Some((moved_id, new_page)) = moved_in_service {
+                    let moved_key = DataKey::SubIndex(moved_id);
+                    if let Some(mut moved_idx) =
+                        env.storage().persistent().get::<_, SubIndex>(&moved_key)
+                    {
+                        moved_idx.service_page = new_page;
+                        env.storage().persistent().set(&moved_key, &moved_idx);
+                        bump_persistent(&env, &moved_key, ps);
+                    }
+                }
 
-        // Append to service's subscriber list
-        let svc_subs_key = DataKey::ServiceSubs(service_id);
-        let mut svc_sub_ids: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&svc_subs_key)
-            .unwrap_or_else(|| Vec::new(&env));
-        svc_sub_ids.push_back(sub_id);
-        env.storage().persistent().set(&svc_subs_key, &svc_sub_ids);
-        bump_persistent(&env, &svc_subs_key, ps);
+                let subscriber_for_pages = subscriber.clone();
+                let moved_in_subscriber = paginated_remove(
+                    &env,
+                    |p| DataKey::SubscriberSubsPage(subscriber_for_pages.clone(), p),
+                    &DataKey::SubscriberSubsCount(subscriber.clone()),
+                    old_sub_id,
+                    old_idx.subscriber_page,
+                    ps,
+                );
+                if let Some((moved_id, new_page)) = moved_in_subscriber {
+                    let moved_key = DataKey::SubIndex(moved_id);
+                    if let Some(mut moved_idx) =
+                        env.storage().persistent().get::<_, SubIndex>(&moved_key)
+                    {
+                        moved_idx.subscriber_page = new_page;
+                        env.storage().persistent().set(&moved_key, &moved_idx);
+                        bump_persistent(&env, &moved_key, ps);
+                    }
+                }
+
+                env.storage().persistent().remove(&idx_key);
+            }
+            // The prior Subscription record itself is now unreachable from
+            // any index — drop it so storage doesn't accumulate dead subs.
+            env.storage().persistent().remove(&DataKey::Sub(old_sub_id));
+        }
+
+        // Append to subscriber's paginated index
+        let subscriber_for_sub_pages = subscriber.clone();
+        let subscriber_page = paginated_append(
+            &env,
+            |p| DataKey::SubscriberSubsPage(subscriber_for_sub_pages.clone(), p),
+            &DataKey::SubscriberSubsCount(subscriber.clone()),
+            sub_id,
+            ps,
+        );
+
+        // Append to service's paginated subscriber index
+        let service_page = paginated_append(
+            &env,
+            |p| DataKey::ServiceSubsPage(service_id, p),
+            &DataKey::ServiceSubsCount(service_id),
+            sub_id,
+            ps,
+        );
+
+        // Reverse pointer so cancel/re-subscribe can locate this entry
+        let idx_key = DataKey::SubIndex(sub_id);
+        env.storage().persistent().set(
+            &idx_key,
+            &SubIndex {
+                service_page,
+                subscriber_page,
+            },
+        );
+        bump_persistent(&env, &idx_key, ps);
 
         bump_instance(&env);
 
@@ -654,16 +892,19 @@ impl SubscriptionContract {
         let contract_addr = env.current_contract_address();
         let now = env.ledger().timestamp();
 
-        let svc_subs_key = DataKey::ServiceSubs(service_id);
-        let sub_ids: Vec<u64> = match env.storage().persistent().get(&svc_subs_key) {
-            Some(ids) => {
-                bump_persistent(&env, &svc_subs_key, service.period_secs);
-                ids
-            }
-            None => Vec::new(&env),
+        // Total live subs is tracked in a small companion key — we no longer
+        // load the entire subscriber list to know its size.
+        let count_key = DataKey::ServiceSubsCount(service_id);
+        let count: u64 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        if count > 0 {
+            bump_persistent(&env, &count_key, service.period_secs);
+        }
+        let total: u32 = if count > u32::MAX as u64 {
+            u32::MAX
+        } else {
+            count as u32
         };
 
-        let total = sub_ids.len();
         let start = offset.min(total);
         let end = start.saturating_add(limit).min(total);
 
@@ -671,102 +912,128 @@ impl SubscriptionContract {
         let mut failed: u32 = 0;
         let mut skipped: u32 = 0;
 
-        for i in start..end {
-            let sid = sub_ids.get(i).unwrap();
-            let sub_key = DataKey::Sub(sid);
+        if end > start {
+            let start_page = start / PAGE_SIZE;
+            let last_page = (end - 1) / PAGE_SIZE;
 
-            let mut sub: Subscription = match env.storage().persistent().get(&sub_key) {
-                Some(s) => s,
-                None => {
-                    skipped += 1;
-                    continue;
-                }
-            };
+            'pages: for p in start_page..=last_page {
+                let page_key = DataKey::ServiceSubsPage(service_id, p);
+                let page: Vec<u64> = match env.storage().persistent().get(&page_key) {
+                    Some(v) => {
+                        bump_persistent(&env, &page_key, service.period_secs);
+                        v
+                    }
+                    None => break 'pages,
+                };
 
-            if !sub.auto_renew {
-                skipped += 1;
-                continue;
-            }
+                let page_base = p * PAGE_SIZE;
+                let in_page_start = if p == start_page { start - page_base } else { 0 };
+                let in_page_end =
+                    core::cmp::min(page.len(), end.saturating_sub(page_base));
 
-            if now < sub.next_charge_ts {
-                skipped += 1;
-                continue;
-            }
+                for i in in_page_start..in_page_end {
+                    let sid = page.get(i).unwrap();
+                    let sub_key = DataKey::Sub(sid);
 
-            let payment_result = token_client.try_transfer_from(
-                &contract_addr,
-                &sub.subscriber,
-                &merchant,
-                &sub.price,
-            );
+                    let mut sub: Subscription = match env.storage().persistent().get(&sub_key) {
+                        Some(s) => s,
+                        None => {
+                            skipped += 1;
+                            continue;
+                        }
+                    };
 
-            if payment_result.is_ok() {
-                // Detect trial -> paid transition (first real charge)
-                let was_trial = sub.trial_period_secs > 0
-                    && sub.next_charge_ts == sub.trial_end_ts;
+                    if !sub.auto_renew {
+                        skipped += 1;
+                        continue;
+                    }
 
-                let new_next = match sub.next_charge_ts.checked_add(sub.period_secs) {
-                    Some(ts) => ts,
-                    None => {
-                        // Overflow: disable auto-renew rather than reverting the batch
+                    if now < sub.next_charge_ts {
+                        skipped += 1;
+                        continue;
+                    }
+
+                    let payment_result = token_client.try_transfer_from(
+                        &contract_addr,
+                        &sub.subscriber,
+                        &merchant,
+                        &sub.price,
+                    );
+
+                    if payment_result.is_ok() {
+                        // Detect trial -> paid transition (first real charge)
+                        let was_trial = sub.trial_period_secs > 0
+                            && sub.next_charge_ts == sub.trial_end_ts;
+
+                        let new_next = match sub.next_charge_ts.checked_add(sub.period_secs) {
+                            Some(ts) => ts,
+                            None => {
+                                // Overflow: disable auto-renew rather than reverting the batch
+                                sub.auto_renew = false;
+                                env.storage().persistent().set(&sub_key, &sub);
+                                bump_persistent(&env, &sub_key, sub.period_secs);
+                                failed += 1;
+                                env.events().publish(
+                                    (symbol_short!("chg_fail"),),
+                                    (sub.subscriber.clone(), service_id, sub.sub_id),
+                                );
+                                continue;
+                            }
+                        };
+                        sub.next_charge_ts = new_next;
+                        sub.service_end_ts = new_next;
+                        env.storage().persistent().set(&sub_key, &sub);
+                        bump_persistent(&env, &sub_key, sub.period_secs);
+                        charged += 1;
+
+                        env.events().publish(
+                            (symbol_short!("charge"),),
+                            (sub.subscriber.clone(), service_id, sub.price),
+                        );
+
+                        // Trial just ended -> first paid period started
+                        if was_trial {
+                            env.events().publish(
+                                (symbol_short!("trl_end"),),
+                                (sub.subscriber.clone(), service_id, sub.sub_id),
+                            );
+                        }
+
+                        // Check remaining allowance for next cycle
+                        let remaining_allowance =
+                            token_client.allowance(&sub.subscriber, &contract_addr);
+                        if remaining_allowance < sub.price {
+                            env.events().publish(
+                                (symbol_short!("low_alw"),),
+                                (
+                                    sub.subscriber.clone(),
+                                    service_id,
+                                    remaining_allowance,
+                                    sub.price,
+                                ),
+                            );
+                        }
+
+                        // Check subscriber balance for next cycle
+                        let balance = token_client.balance(&sub.subscriber);
+                        if balance < sub.price {
+                            env.events().publish(
+                                (symbol_short!("low_bal"),),
+                                (sub.subscriber.clone(), service_id, balance, sub.price),
+                            );
+                        }
+                    } else {
                         sub.auto_renew = false;
                         env.storage().persistent().set(&sub_key, &sub);
                         bump_persistent(&env, &sub_key, sub.period_secs);
                         failed += 1;
+
                         env.events().publish(
                             (symbol_short!("chg_fail"),),
                             (sub.subscriber.clone(), service_id, sub.sub_id),
                         );
-                        continue;
                     }
-                };
-                sub.next_charge_ts = new_next;
-                sub.service_end_ts = new_next;
-                env.storage().persistent().set(&sub_key, &sub);
-                bump_persistent(&env, &sub_key, sub.period_secs);
-                charged += 1;
-
-                env.events().publish(
-                    (symbol_short!("charge"),),
-                    (sub.subscriber.clone(), service_id, sub.price),
-                );
-
-                // Trial just ended -> first paid period started
-                if was_trial {
-                    env.events().publish(
-                        (symbol_short!("trl_end"),),
-                        (sub.subscriber.clone(), service_id, sub.sub_id),
-                    );
                 }
-
-                // Check remaining allowance for next cycle
-                let remaining_allowance =
-                    token_client.allowance(&sub.subscriber, &contract_addr);
-                if remaining_allowance < sub.price {
-                    env.events().publish(
-                        (symbol_short!("low_alw"),),
-                        (sub.subscriber.clone(), service_id, remaining_allowance, sub.price),
-                    );
-                }
-
-                // Check subscriber balance for next cycle
-                let balance = token_client.balance(&sub.subscriber);
-                if balance < sub.price {
-                    env.events().publish(
-                        (symbol_short!("low_bal"),),
-                        (sub.subscriber.clone(), service_id, balance, sub.price),
-                    );
-                }
-            } else {
-                sub.auto_renew = false;
-                env.storage().persistent().set(&sub_key, &sub);
-                bump_persistent(&env, &sub_key, sub.period_secs);
-                failed += 1;
-
-                env.events().publish(
-                    (symbol_short!("chg_fail"),),
-                    (sub.subscriber.clone(), service_id, sub.sub_id),
-                );
             }
         }
 
@@ -814,17 +1081,18 @@ impl SubscriptionContract {
     pub fn get_subscriber_subs(env: Env, subscriber: Address) -> Vec<Subscription> {
         subscriber.require_auth();
 
-        let ss_key = DataKey::SubscriberSubs(subscriber);
-        let sub_ids: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&ss_key)
-            .unwrap_or_else(|| Vec::new(&env));
+        let subscriber_for_pages = subscriber.clone();
+        let sub_ids = paginated_read_all(
+            &env,
+            |p| DataKey::SubscriberSubsPage(subscriber_for_pages.clone(), p),
+            &DataKey::SubscriberSubsCount(subscriber),
+        );
 
         let mut result: Vec<Subscription> = Vec::new(&env);
         for i in 0..sub_ids.len() {
             let sid = sub_ids.get(i).unwrap();
-            if let Some(sub) = env.storage().persistent().get::<_, Subscription>(&DataKey::Sub(sid))
+            if let Some(sub) =
+                env.storage().persistent().get::<_, Subscription>(&DataKey::Sub(sid))
             {
                 result.push_back(sub);
             }
@@ -850,12 +1118,11 @@ impl SubscriptionContract {
             return Err(ContractError::NotServiceOwner);
         }
 
-        let svc_subs_key = DataKey::ServiceSubs(service_id);
-        let sub_ids: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&svc_subs_key)
-            .unwrap_or_else(|| Vec::new(&env));
+        let sub_ids = paginated_read_all(
+            &env,
+            |p| DataKey::ServiceSubsPage(service_id, p),
+            &DataKey::ServiceSubsCount(service_id),
+        );
 
         let mut result: Vec<Subscription> = Vec::new(&env);
         for i in 0..sub_ids.len() {
@@ -878,12 +1145,12 @@ impl SubscriptionContract {
     }
 
     pub fn get_merchant_services(env: Env, merchant: Address) -> Vec<Service> {
-        let ms_key = DataKey::MerchantServices(merchant);
-        let svc_ids: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&ms_key)
-            .unwrap_or_else(|| Vec::new(&env));
+        let merchant_for_pages = merchant.clone();
+        let svc_ids = paginated_read_all(
+            &env,
+            |p| DataKey::MerchantServicesPage(merchant_for_pages.clone(), p),
+            &DataKey::MerchantServicesCount(merchant),
+        );
 
         let mut result: Vec<Service> = Vec::new(&env);
         for i in 0..svc_ids.len() {
