@@ -37,6 +37,8 @@ pub enum ContractError {
     InvalidServiceName = 10,
     SubscriptionExpired = 11,
     ServiceNotActive = 12,
+    NoAdminProposed = 13,
+    NotProposedAdmin = 14,
 }
 
 // ---------------------------------------------------------------------------
@@ -47,6 +49,7 @@ pub enum ContractError {
 pub enum DataKey {
     // Instance storage
     Admin,
+    PendingAdmin,
     Token,
     NextServiceId,
     NextSubId,
@@ -1258,6 +1261,46 @@ impl SubscriptionContract {
     }
 
     // ---- Admin ------------------------------------------------------------
+
+    /// Propose a new admin. Two-step rotation: the proposed address still
+    /// has to call `accept_admin` to take over, so a fat-fingered or
+    /// uncontrolled address cannot strand the admin role.
+    pub fn propose_admin(env: Env, new_admin: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+        bump_instance(&env);
+
+        env.events()
+            .publish((symbol_short!("adm_prop"),), (admin, new_admin));
+    }
+
+    /// Complete admin rotation. The pending admin proves control of their
+    /// address by signing this call; only after that does `Admin` flip.
+    pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), ContractError> {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(ContractError::NoAdminProposed)?;
+
+        if new_admin != pending {
+            return Err(ContractError::NotProposedAdmin);
+        }
+        new_admin.require_auth();
+
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        bump_instance(&env);
+
+        env.events()
+            .publish((symbol_short!("adm_acc"),), new_admin);
+
+        Ok(())
+    }
 
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
