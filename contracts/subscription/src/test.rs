@@ -191,6 +191,76 @@ fn test_get_service_not_found() {
 }
 
 // ===========================================================================
+// Service activation (LIB-12)
+// ===========================================================================
+
+#[test]
+fn test_set_service_active_blocks_new_subscriptions() {
+    let s = setup();
+    let svc = register_default_service(&s);
+
+    s.client.set_service_active(&s.merchant, &svc.service_id, &false);
+
+    let result = s
+        .client
+        .try_subscribe(&s.subscriber, &svc.service_id, &true);
+    assert_eq!(result, Err(Ok(ContractError::ServiceNotActive)));
+}
+
+#[test]
+fn test_set_service_active_reactivation_allows_subscriptions() {
+    let s = setup();
+    let svc = register_default_service(&s);
+
+    s.client.set_service_active(&s.merchant, &svc.service_id, &false);
+    s.client.set_service_active(&s.merchant, &svc.service_id, &true);
+
+    let sub = s.client.subscribe(&s.subscriber, &svc.service_id, &true);
+    assert_eq!(sub.auto_renew, true);
+}
+
+#[test]
+fn test_set_service_active_only_service_owner() {
+    let s = setup();
+    let svc = register_default_service(&s);
+
+    let result = s
+        .client
+        .try_set_service_active(&s.merchant2, &svc.service_id, &false);
+    assert_eq!(result, Err(Ok(ContractError::NotServiceOwner)));
+}
+
+#[test]
+fn test_set_service_active_nonexistent_service() {
+    let s = setup();
+    let result = s.client.try_set_service_active(&s.merchant, &99, &false);
+    assert_eq!(result, Err(Ok(ContractError::ServiceNotFound)));
+}
+
+#[test]
+fn test_set_service_active_does_not_affect_existing_subs() {
+    // Existing subscriptions keep their access through service_end_ts and
+    // continue to be billable by process(). Deactivation is a sign-up gate,
+    // not a kill-switch for outstanding obligations.
+    let s = setup();
+    let svc = register_default_service(&s);
+    let _sub = s.client.subscribe(&s.subscriber, &svc.service_id, &true);
+
+    s.client.set_service_active(&s.merchant, &svc.service_id, &false);
+
+    assert_eq!(
+        s.client
+            .is_subscription_active(&s.subscriber, &svc.service_id),
+        true
+    );
+
+    advance_time(&s.env, MONTH + 1);
+    let r = s.client.process(&s.merchant, &svc.service_id, &0, &10);
+    assert_eq!(r.charged, 1);
+    assert_eq!(r.failed, 0);
+}
+
+// ===========================================================================
 // Subscribe
 // ===========================================================================
 
