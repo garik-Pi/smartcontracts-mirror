@@ -187,35 +187,36 @@ fn do_approve(
     subscriber: &Address,
     service: &Service,
     periods: u64,
-    extra_secs: u64,
 ) -> Result<(), ContractError> {
     let token = get_token(env);
     let token_client = TokenClient::new(env, &token);
     let contract_addr = env.current_contract_address();
 
-    let approve_amount = service
+    let this_sub_amount = service
         .price
         .checked_mul(periods as i128)
         .ok_or(ContractError::TimestampOverflow)?;
-    let secs_to_approve = service
-        .period_secs
-        .saturating_mul(periods)
-        .saturating_add(extra_secs);
-    let ledgers_to_approve = secs_to_approve / 5;
-    let capped_ledgers = if ledgers_to_approve > u32::MAX as u64 {
-        u32::MAX
-    } else {
-        ledgers_to_approve as u32
-    };
+
+    // LIB-9: allowance is keyed by (owner, spender), not by service. Read
+    // what's already approved and add this sub's budget on top — a plain
+    // overwrite would shrink the budget reserved by any other active sub
+    // of this user and silently break their renewals.
+    let existing_allowance = token_client.allowance(subscriber, &contract_addr);
+    let approve_amount = existing_allowance
+        .checked_add(this_sub_amount)
+        .ok_or(ContractError::TimestampOverflow)?;
+
+    // Use the network's max ttl unconditionally so a later approve with a
+    // shorter period_secs cannot truncate the existing budget's window.
+    // The user's revoke path (cancel / toggle off) already clears this in
+    // a tight cancellation boundary, so the wider window is bounded by
+    // the user's explicit lifecycle, not by max_ttl alone.
     let max_ttl = env.storage().max_ttl().saturating_sub(1);
-    let capped_ledgers = core::cmp::min(capped_ledgers, max_ttl);
     // Round down to a stable bucket so the value is identical between simulate and execute.
     // 720 ledgers ≈ 1 hour — much larger than the simulate→execute gap (~seconds).
     const LEDGER_BUCKET: u32 = 720;
-    let raw_expiration = env.ledger().sequence().saturating_add(capped_ledgers);
-    let max_expiration = env.ledger().sequence().saturating_add(max_ttl);
-    let capped = core::cmp::min(raw_expiration, max_expiration);
-    let expiration_ledger = (capped / LEDGER_BUCKET) * LEDGER_BUCKET;
+    let raw_expiration = env.ledger().sequence().saturating_add(max_ttl);
+    let expiration_ledger = (raw_expiration / LEDGER_BUCKET) * LEDGER_BUCKET;
 
     token_client.approve(
         subscriber,
@@ -606,14 +607,9 @@ impl SubscriptionContract {
             bump_persistent(&env, &trial_used_key, service.period_secs);
 
             if auto_renew {
-                // Trial + auto_renew: approve for future periods; extra_secs covers the trial
-                do_approve(
-                    &env,
-                    &subscriber,
-                    &service,
-                    service.approve_periods,
-                    service.trial_period_secs,
-                )?;
+                // Trial + auto_renew: approve for future periods. Allowance
+                // expiration uses max_ttl so the trial window is covered too.
+                do_approve(&env, &subscriber, &service, service.approve_periods)?;
 
                 let balance = token_client.balance(&subscriber);
                 if balance < service.price {
@@ -643,7 +639,7 @@ impl SubscriptionContract {
 
             // Approve before transfer so the contract is pre-authorized
             let periods = if auto_renew { service.approve_periods } else { 1 };
-            do_approve(&env, &subscriber, &service, periods, 0)?;
+            do_approve(&env, &subscriber, &service, periods)?;
 
             // No trial – immediate first payment
             token_client.transfer(&subscriber, &service.merchant, &service.price);
@@ -863,7 +859,7 @@ impl SubscriptionContract {
                 .get(&svc_key)
                 .ok_or(ContractError::ServiceNotFound)?;
 
-            do_approve(&env, &subscriber, &service, service.approve_periods, 0)?;
+            do_approve(&env, &subscriber, &service, service.approve_periods)?;
             bump_persistent(&env, &svc_key, sub.period_secs);
         } else if !any_active_auto_renew(&env, &subscriber) {
             // Disabling and no other sub still needs the allowance — clear it.
@@ -915,7 +911,7 @@ impl SubscriptionContract {
             .get(&svc_key)
             .ok_or(ContractError::ServiceNotFound)?;
 
-        do_approve(&env, &subscriber, &service, service.approve_periods, 0)?;
+        do_approve(&env, &subscriber, &service, service.approve_periods)?;
 
         sub.auto_renew = true;
         env.storage().persistent().set(&sub_key, &sub);

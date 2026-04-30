@@ -1173,6 +1173,94 @@ fn test_toggle_auto_renew_off_revokes_allowance() {
 }
 
 #[test]
+fn test_subscribe_aggregates_allowance_across_services() {
+    // LIB-9: subscribing to a second service must add its budget on top of
+    // the existing allowance, not overwrite it.
+    let s = setup();
+    let svc1 = register_default_service(&s); // PRICE=1000, periods=12
+    let svc2 = s.client.register_service(
+        &s.merchant2,
+        &String::from_str(&s.env, "Cheap"),
+        &10,
+        &MONTH,
+        &0,
+        &12,
+    );
+
+    s.client.subscribe(&s.subscriber, &svc1.service_id, &true);
+    let after_sub1 = s.token.allowance(&s.subscriber, &s.contract_addr);
+    assert_eq!(after_sub1, 12 * PRICE); // sub1's full budget
+
+    s.client.subscribe(&s.subscriber, &svc2.service_id, &true);
+    let after_sub2 = s.token.allowance(&s.subscriber, &s.contract_addr);
+    assert_eq!(after_sub2, 12 * PRICE + 12 * 10); // sum of both budgets
+}
+
+#[test]
+fn test_subscribe_to_cheaper_service_does_not_break_existing() {
+    // LIB-9 regression: under the old overwrite semantics, subscribing to a
+    // tiny-priced service after a large-priced one would shrink the
+    // allowance to the small budget (12 * 10 = 120) and the next process()
+    // for the large sub (needs 1000) would fail and disable it.
+    let s = setup();
+    let svc1 = register_default_service(&s);
+    let svc2 = s.client.register_service(
+        &s.merchant2,
+        &String::from_str(&s.env, "Cheap"),
+        &10,
+        &MONTH,
+        &0,
+        &12,
+    );
+
+    s.client.subscribe(&s.subscriber, &svc1.service_id, &true);
+    s.client.subscribe(&s.subscriber, &svc2.service_id, &true);
+
+    advance_time(&s.env, MONTH + 1);
+
+    // sub1 must still be billable. With the bug, this would charged=0 / failed=1.
+    let r1 = s.client.process(&s.merchant, &svc1.service_id, &0, &10);
+    assert_eq!(r1.charged, 1);
+    assert_eq!(r1.failed, 0);
+
+    // sub2 also bills cleanly.
+    let r2 = s.client.process(&s.merchant2, &svc2.service_id, &0, &10);
+    assert_eq!(r2.charged, 1);
+    assert_eq!(r2.failed, 0);
+}
+
+#[test]
+fn test_extend_subscription_does_not_truncate_other_sub_budget() {
+    // Refreshing one sub's allowance via extend_subscription must not shrink
+    // the budget already reserved for the user's other active subs.
+    let s = setup();
+    let svc1 = register_default_service(&s); // PRICE=1000, periods=12
+    let svc2 = s.client.register_service(
+        &s.merchant2,
+        &String::from_str(&s.env, "Cheap"),
+        &10,
+        &MONTH,
+        &0,
+        &12,
+    );
+
+    s.client.subscribe(&s.subscriber, &svc1.service_id, &true);
+    let sub2 = s.client.subscribe(&s.subscriber, &svc2.service_id, &false);
+    // sub2 above used auto_renew=false → only 1 period approved (10)
+    let allowance_after_subs = s.token.allowance(&s.subscriber, &s.contract_addr);
+    assert_eq!(allowance_after_subs, 12 * PRICE + 10);
+
+    // Extend sub2 — refreshes its budget on top of existing allowance
+    s.client.extend_subscription(&s.subscriber, &sub2.sub_id);
+    let allowance_after_extend = s.token.allowance(&s.subscriber, &s.contract_addr);
+
+    // sub1's 12000 budget must still be intact; extend just adds sub2's
+    // 12-period budget on top.
+    assert!(allowance_after_extend >= 12 * PRICE);
+    assert_eq!(allowance_after_extend, 12 * PRICE + 10 + 12 * 10);
+}
+
+#[test]
 fn test_toggle_auto_renew_back_on_restores_allowance() {
     // Toggle off -> revokes; toggle on -> the existing re-approve path
     // refreshes the allowance, so the user can resume billing.
