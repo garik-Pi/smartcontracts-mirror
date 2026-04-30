@@ -968,3 +968,192 @@ fn test_timestamp_overflow() {
         .try_subscribe(&s.subscriber, &svc.service_id, &true);
     assert_eq!(result, Err(Ok(ContractError::TimestampOverflow)));
 }
+
+// ===========================================================================
+// Pagination (LIB-6: paginated indexes + stale-entry cleanup)
+// ===========================================================================
+//
+// PAGE_SIZE in the contract is 50; tests use 55 entries to span exactly two
+// pages, which is enough to exercise the page-boundary code paths without
+// blowing up test setup time.
+
+const PAGINATION_TEST_N: u32 = 55;
+
+fn fund_and_subscribe(s: &Setup, service_id: u64) -> Address {
+    let a = Address::generate(&s.env);
+    s.token_admin.mint(&a, &INITIAL_BALANCE);
+    s.client.subscribe(&a, &service_id, &true);
+    a
+}
+
+#[test]
+fn test_pagination_get_merchant_subs_across_pages() {
+    let s = setup();
+    let svc = register_default_service(&s);
+
+    for _ in 0..PAGINATION_TEST_N {
+        fund_and_subscribe(&s, svc.service_id);
+    }
+
+    let result = s.client.get_merchant_subs(&s.merchant, &svc.service_id);
+    assert_eq!(result.len(), PAGINATION_TEST_N);
+}
+
+#[test]
+fn test_pagination_get_subscriber_subs_across_pages() {
+    let s = setup();
+
+    // Single subscriber subscribed to many services — exercises
+    // SubscriberSubs spanning multiple pages.
+    let mut svc_ids: soroban_sdk::Vec<u64> = soroban_sdk::Vec::new(&s.env);
+    for _ in 0..PAGINATION_TEST_N {
+        let svc = s.client.register_service(
+            &s.merchant,
+            &String::from_str(&s.env, "Plan"),
+            &PRICE,
+            &MONTH,
+            &0,
+            &12,
+        );
+        svc_ids.push_back(svc.service_id);
+    }
+    for i in 0..svc_ids.len() {
+        s.client.subscribe(&s.subscriber, &svc_ids.get(i).unwrap(), &true);
+    }
+
+    let result = s.client.get_subscriber_subs(&s.subscriber);
+    assert_eq!(result.len(), PAGINATION_TEST_N);
+}
+
+#[test]
+fn test_pagination_get_merchant_services_across_pages() {
+    let s = setup();
+
+    for _ in 0..PAGINATION_TEST_N {
+        s.client.register_service(
+            &s.merchant,
+            &String::from_str(&s.env, "Plan"),
+            &PRICE,
+            &MONTH,
+            &0,
+            &12,
+        );
+    }
+
+    let result = s.client.get_merchant_services(&s.merchant);
+    assert_eq!(result.len(), PAGINATION_TEST_N);
+}
+
+#[test]
+fn test_pagination_process_iterates_across_pages() {
+    let s = setup();
+    let svc = register_default_service(&s);
+
+    for _ in 0..PAGINATION_TEST_N {
+        fund_and_subscribe(&s, svc.service_id);
+    }
+
+    advance_time(&s.env, MONTH + 1);
+
+    let r = s.client.process(&s.merchant, &svc.service_id, &0, &PAGINATION_TEST_N);
+    assert_eq!(r.charged, PAGINATION_TEST_N);
+    assert_eq!(r.total, PAGINATION_TEST_N);
+}
+
+#[test]
+fn test_pagination_process_offset_in_second_page() {
+    let s = setup();
+    let svc = register_default_service(&s);
+
+    for _ in 0..PAGINATION_TEST_N {
+        fund_and_subscribe(&s, svc.service_id);
+    }
+
+    advance_time(&s.env, MONTH + 1);
+
+    // Process the first page only
+    let r1 = s.client.process(&s.merchant, &svc.service_id, &0, &50);
+    assert_eq!(r1.charged, 50);
+    assert_eq!(r1.total, PAGINATION_TEST_N);
+
+    // Process the tail (offset 50 lands on the second page).
+    // Limit larger than remaining; should charge only what's left.
+    let r2 = s.client.process(&s.merchant, &svc.service_id, &50, &50);
+    assert_eq!(r2.charged, 5);
+    assert_eq!(r2.total, PAGINATION_TEST_N);
+    assert_eq!(r2.skipped, 0);
+}
+
+#[test]
+fn test_resubscribe_prunes_stale_index_entries() {
+    // LIB-6 regression: re-subscribe must remove the dead prior sub_id from
+    // ServiceSubs/SubscriberSubs, otherwise the indexes grow unboundedly
+    // across subscribe→cancel→expire→subscribe cycles.
+    let s = setup();
+    let svc = register_default_service(&s);
+
+    let cycles: u64 = 5;
+    for i in 0..cycles {
+        let sub = s.client.subscribe(&s.subscriber, &svc.service_id, &true);
+        s.client.cancel(&s.subscriber, &sub.sub_id);
+        advance_time(&s.env, (i + 1) * (MONTH + 1));
+    }
+
+    // Despite 5 cycles, only the most recent (now-expired) sub remains
+    // in either index — the prior 4 sub_ids were pruned on re-subscribe.
+    let merchant_subs = s.client.get_merchant_subs(&s.merchant, &svc.service_id);
+    assert_eq!(merchant_subs.len(), 1);
+
+    let subscriber_subs = s.client.get_subscriber_subs(&s.subscriber);
+    assert_eq!(subscriber_subs.len(), 1);
+}
+
+#[test]
+fn test_resubscribe_cross_page_swap_updates_reverse_pointer() {
+    // When pruning a sub from a non-tail page, the global tail is moved
+    // into the freed slot — its reverse pointer (SubIndex.service_page)
+    // MUST be rewritten, otherwise a future prune of the moved sub would
+    // look in the wrong (old, now-empty) page, fail to decrement the
+    // count, and leave the index in an inconsistent state.
+    let s = setup();
+    let svc = register_default_service(&s);
+
+    // First subscriber lands at page 0, slot 0
+    let first = Address::generate(&s.env);
+    s.token_admin.mint(&first, &INITIAL_BALANCE);
+    let first_sub = s.client.subscribe(&first, &svc.service_id, &true);
+
+    // Fill the rest of page 0 (49 more entries)
+    for _ in 0..49 {
+        fund_and_subscribe(&s, svc.service_id);
+    }
+
+    // The 51st subscriber lands at page 1, slot 0 — global tail
+    let tail = Address::generate(&s.env);
+    s.token_admin.mint(&tail, &INITIAL_BALANCE);
+    let tail_sub = s.client.subscribe(&tail, &svc.service_id, &true);
+
+    // Cancel + expire + re-subscribe `first`. This triggers:
+    //   1) prune first_sub from page 0 slot 0
+    //   2) swap with global tail (tail_sub at page 1 slot 0)
+    //   3) tail_sub.SubIndex.service_page must be rewritten 1 -> 0
+    //   4) append new sub for `first` at the new global tail
+    s.client.cancel(&first, &first_sub.sub_id);
+    advance_time(&s.env, MONTH + 1);
+    s.client.subscribe(&first, &svc.service_id, &true);
+
+    // Now exercise tail's pruning path. If step 3 above failed to update
+    // the reverse pointer, paginated_remove would search page 1 (where
+    // tail_sub no longer lives), find nothing, and skip the count
+    // decrement. The next append would then push the count to 52
+    // instead of staying at 51.
+    s.client.cancel(&tail, &tail_sub.sub_id);
+    advance_time(&s.env, 3 * (MONTH + 1));
+    s.client.subscribe(&tail, &svc.service_id, &true);
+
+    // process() exposes the live count via ProcessResult.total — assert
+    // it directly. With the bug present this would be 52.
+    advance_time(&s.env, 6 * (MONTH + 1));
+    let r = s.client.process(&s.merchant, &svc.service_id, &0, &200);
+    assert_eq!(r.total, 51);
+}
