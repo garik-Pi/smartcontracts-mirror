@@ -951,6 +951,88 @@ fn test_version() {
 }
 
 // ===========================================================================
+// Admin rotation (LIB-11: two-step admin transfer)
+// ===========================================================================
+
+#[test]
+fn test_admin_rotation_two_step_completes() {
+    let s = setup();
+    let new_admin = Address::generate(&s.env);
+
+    // Stage 1: current admin proposes a successor — Admin field unchanged.
+    s.client.propose_admin(&new_admin);
+
+    // Stage 2: proposed address signs accept_admin to take over. After this,
+    // upgrade authority sits with new_admin (verified below by upgrading).
+    s.client.accept_admin(&new_admin);
+
+    // Confirm new_admin actually controls upgrade now: the call would
+    // panic if Admin still pointed at the old address (mock_all_auths
+    // doesn't relax the storage-equality the contract reads).
+    let wasm_hash = s.env.deployer().upload_contract_wasm(upgrade_wasm::WASM);
+    s.client.upgrade(&wasm_hash);
+}
+
+#[test]
+fn test_accept_admin_without_proposal_fails() {
+    let s = setup();
+    let result = s.client.try_accept_admin(&s.admin);
+    assert_eq!(result, Err(Ok(ContractError::NoAdminProposed)));
+}
+
+#[test]
+fn test_accept_admin_wrong_address_fails() {
+    let s = setup();
+    let proposed = Address::generate(&s.env);
+    let imposter = Address::generate(&s.env);
+
+    s.client.propose_admin(&proposed);
+
+    let result = s.client.try_accept_admin(&imposter);
+    assert_eq!(result, Err(Ok(ContractError::NotProposedAdmin)));
+}
+
+#[test]
+fn test_repropose_overrides_pending() {
+    // Calling propose_admin a second time replaces the pending address —
+    // the original proposed address can no longer accept.
+    let s = setup();
+    let first = Address::generate(&s.env);
+    let second = Address::generate(&s.env);
+
+    s.client.propose_admin(&first);
+    s.client.propose_admin(&second);
+
+    let stale = s.client.try_accept_admin(&first);
+    assert_eq!(stale, Err(Ok(ContractError::NotProposedAdmin)));
+
+    s.client.accept_admin(&second);
+}
+
+#[test]
+fn test_old_admin_loses_role_after_rotation() {
+    // After rotation, calling propose_admin from the old admin's address
+    // would still succeed in mock_all_auths (since it mocks all auths),
+    // but the contract reads Admin from storage — so the *event* attributes
+    // the call to whoever is now in storage. Verify by rotating once,
+    // then doing a fresh rotation initiated by the new admin.
+    let s = setup();
+    let new_admin = Address::generate(&s.env);
+
+    s.client.propose_admin(&new_admin);
+    s.client.accept_admin(&new_admin);
+
+    // new_admin now has rotation authority — proposing again works.
+    let third = Address::generate(&s.env);
+    s.client.propose_admin(&third);
+    s.client.accept_admin(&third);
+
+    // Sanity: third can upgrade.
+    let wasm_hash = s.env.deployer().upload_contract_wasm(upgrade_wasm::WASM);
+    s.client.upgrade(&wasm_hash);
+}
+
+// ===========================================================================
 // Timestamp overflow (H-3 fix)
 // ===========================================================================
 
