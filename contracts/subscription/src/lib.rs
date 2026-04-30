@@ -238,6 +238,21 @@ fn do_approve(
     Ok(())
 }
 
+/// Set the contract's allowance from `subscriber` to zero. Soroban's
+/// `approve(amount=0, expiration=0)` clears the entry entirely. Inner-
+/// invoked from `cancel()` / `toggle_auto_renew(off)` so revocation rides
+/// inside the same atomic auth tree the caller already signed for.
+fn do_revoke_approval(env: &Env, subscriber: &Address) {
+    let token = get_token(env);
+    let token_client = TokenClient::new(env, &token);
+    let contract_addr = env.current_contract_address();
+
+    token_client.approve(subscriber, &contract_addr, &0i128, &0u32);
+
+    env.events()
+        .publish((symbol_short!("revoke"),), (subscriber.clone(), token));
+}
+
 // ---------------------------------------------------------------------------
 // Paginated index helpers
 // ---------------------------------------------------------------------------
@@ -385,6 +400,38 @@ where
         }
     }
     out
+}
+
+/// True if `subscriber` has any subscription whose `auto_renew` is still
+/// set — i.e. some other sub still needs the on-chain allowance. Reads
+/// from storage, so the caller must persist any flag flip *before* asking.
+/// Bounded by the user's actual sub count (typically tiny), iterated via
+/// the paginated SubscriberSubs index.
+fn any_active_auto_renew(env: &Env, subscriber: &Address) -> bool {
+    let count_key = DataKey::SubscriberSubsCount(subscriber.clone());
+    let count: u64 = env.storage().persistent().get(&count_key).unwrap_or(0);
+    if count == 0 {
+        return false;
+    }
+    let last_page_idx = ((count - 1) / PAGE_SIZE as u64) as u32;
+    for p in 0..=last_page_idx {
+        let page_key = DataKey::SubscriberSubsPage(subscriber.clone(), p);
+        if let Some(page) = env.storage().persistent().get::<_, Vec<u64>>(&page_key) {
+            for i in 0..page.len() {
+                let sid = page.get(i).unwrap();
+                if let Some(s) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, Subscription>(&DataKey::Sub(sid))
+                {
+                    if s.auto_renew {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -748,6 +795,18 @@ impl SubscriptionContract {
         sub.auto_renew = false;
         env.storage().persistent().set(&sub_key, &sub);
         bump_persistent(&env, &sub_key, sub.period_secs);
+
+        // Smart revoke: clear the on-chain allowance once this subscriber has
+        // no other auto-renewing subs in this contract. Allowance is per
+        // (subscriber, contract) — not per service — so unconditional revoke
+        // would also tear down billing for any other live subscription. By
+        // checking first, we keep the cancellation boundary tight for the
+        // single-sub case (the audit's main concern) without breaking
+        // multi-sub UX.
+        if !any_active_auto_renew(&env, &subscriber) {
+            do_revoke_approval(&env, &subscriber);
+        }
+
         bump_instance(&env);
 
         let now = env.ledger().timestamp();
@@ -790,8 +849,13 @@ impl SubscriptionContract {
 
         sub.auto_renew = !sub.auto_renew;
 
-        // If re-enabling, refresh the token approval so process() can charge
+        // Persist the flip before the allowance call so any_active_auto_renew
+        // sees the up-to-date flag for *this* sub.
+        env.storage().persistent().set(&sub_key, &sub);
+        bump_persistent(&env, &sub_key, sub.period_secs);
+
         if sub.auto_renew {
+            // Re-enabling: refresh the token approval so process() can charge.
             let svc_key = DataKey::Service(sub.service_id);
             let service: Service = env
                 .storage()
@@ -801,10 +865,11 @@ impl SubscriptionContract {
 
             do_approve(&env, &subscriber, &service, service.approve_periods, 0)?;
             bump_persistent(&env, &svc_key, sub.period_secs);
+        } else if !any_active_auto_renew(&env, &subscriber) {
+            // Disabling and no other sub still needs the allowance — clear it.
+            do_revoke_approval(&env, &subscriber);
         }
 
-        env.storage().persistent().set(&sub_key, &sub);
-        bump_persistent(&env, &sub_key, sub.period_secs);
         bump_instance(&env);
 
         env.events().publish(
