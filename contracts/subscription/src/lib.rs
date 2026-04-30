@@ -532,6 +532,41 @@ impl SubscriptionContract {
         Ok(service)
     }
 
+    /// Activate or deactivate a service. Only the service's own merchant
+    /// may call this. While inactive, `subscribe()` rejects new sign-ups
+    /// for the service (existing subscriptions are unaffected and continue
+    /// billing through their `service_end_ts`). Used as the merchant's
+    /// off-switch for retiring old plans or pausing sign-ups.
+    pub fn set_service_active(
+        env: Env,
+        merchant: Address,
+        service_id: u64,
+        active: bool,
+    ) -> Result<(), ContractError> {
+        merchant.require_auth();
+
+        let svc_key = DataKey::Service(service_id);
+        let mut service: Service = env
+            .storage()
+            .persistent()
+            .get(&svc_key)
+            .ok_or(ContractError::ServiceNotFound)?;
+
+        if service.merchant != merchant {
+            return Err(ContractError::NotServiceOwner);
+        }
+
+        service.is_active = active;
+        env.storage().persistent().set(&svc_key, &service);
+        bump_persistent(&env, &svc_key, service.period_secs);
+        bump_instance(&env);
+
+        env.events()
+            .publish((symbol_short!("svc_act"),), (merchant, service_id, active));
+
+        Ok(())
+    }
+
     // ---- Subscription lifecycle -------------------------------------------
 
     /// Subscribe to a service.
