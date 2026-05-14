@@ -890,6 +890,80 @@ fn test_process_trial_expiry_and_first_charge() {
 }
 
 #[test]
+fn test_sub_ttl_window_secs_covers_trial_window() {
+    // LIB-7 unit check: the window helper must reduce to `2 * period_secs`
+    // for non-trial subs (preserving prior behavior) and grow to
+    // `trial_period_secs + period_secs` once a trial is configured, so the
+    // first post-trial process() call always finds the storage alive.
+
+    // Non-trial: identical to the pre-fix behavior of `period_secs * 2`.
+    assert_eq!(sub_ttl_window_secs(DAY, 0), 2 * DAY);
+    assert_eq!(sub_ttl_window_secs(MONTH, 0), 2 * MONTH);
+
+    // Trial shorter than period: still bounded by `2 * period_secs`.
+    assert_eq!(sub_ttl_window_secs(MONTH, WEEK), 2 * MONTH);
+
+    // Trial == period: degenerates to `2 * period_secs`.
+    assert_eq!(sub_ttl_window_secs(WEEK, WEEK), 2 * WEEK);
+
+    // Trial much longer than period: window covers trial + one billing slack.
+    let long_trial = 90 * DAY;
+    assert_eq!(sub_ttl_window_secs(DAY, long_trial), long_trial + DAY);
+    assert!(sub_ttl_window_secs(DAY, long_trial) > 2 * DAY);
+
+    // Saturating add: extreme values must not panic.
+    assert_eq!(sub_ttl_window_secs(u64::MAX, u64::MAX), u64::MAX);
+}
+
+#[test]
+fn test_long_trial_state_survives_until_first_charge() {
+    // LIB-7 regression: bump_persistent used to derive TTL from period_secs
+    // alone, so a long trial (e.g. 90 days) with a short billing period (1
+    // day) could see Sub / SubServicePair / Service / ServiceSubs expire
+    // before the first post-trial process() call ever landed — silently
+    // killing the subscription before its first paid charge. After the fix,
+    // sub_ttl_window_secs covers the trial window plus one billing period of
+    // slack, so all sub-scoped keys must survive the entire trial.
+    let s = setup();
+
+    let period = DAY;
+    let trial = 90 * DAY;
+
+    let svc = s.client.register_service(
+        &s.merchant,
+        &String::from_str(&s.env, "Long Trial"),
+        &PRICE,
+        &period,
+        &trial,
+        &12,
+    );
+
+    let sub = s.client.subscribe(&s.subscriber, &svc.service_id, &true);
+
+    // Advance the ledger past the OLD `2 * period_secs` TTL window (~2 days
+    // in ledgers) but stay well within the trial. Without the fix every
+    // sub-scoped key would have expired here; with it they all survive.
+    const TEST_SECS_PER_LEDGER: u64 = 5;
+    let old_ttl_ledgers = (2 * period / TEST_SECS_PER_LEDGER) as u32;
+    let advance_ledgers = old_ttl_ledgers.saturating_add(50_000);
+    s.env.ledger().with_mut(|li| {
+        li.sequence_number = li.sequence_number.saturating_add(advance_ledgers);
+        li.timestamp += trial;
+    });
+
+    let fetched = s.client.get_subscription(&s.subscriber, &sub.sub_id);
+    assert_eq!(fetched.sub_id, sub.sub_id);
+    let fetched_svc = s.client.get_service(&svc.service_id);
+    assert_eq!(fetched_svc.service_id, svc.service_id);
+
+    // First post-trial charge succeeds — proves ServiceSubs page survived too.
+    let result = s.client.process(&s.merchant, &svc.service_id, &0, &10);
+    assert_eq!(result.charged, 1);
+    assert_eq!(result.failed, 0);
+    assert_eq!(s.token.balance(&s.subscriber), INITIAL_BALANCE - PRICE);
+}
+
+#[test]
 fn test_process_skips_no_auto_renew() {
     let s = setup();
     let svc = register_default_service(&s);

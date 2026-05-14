@@ -136,9 +136,11 @@ fn bump_instance(env: &Env) {
         .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND);
 }
 
-/// Compute TTL extend: max(period_secs * 2 / SECS_PER_LEDGER, MIN_FLOOR)
-fn ttl_extend_for_period(period_secs: u64) -> u32 {
-    let ledgers = period_secs.saturating_mul(2) / SECS_PER_LEDGER;
+/// Convert a desired live-window in seconds to ledger count, clamped to the
+/// network minimum-TTL floor. Callers pass the full window they need; no
+/// implicit doubling here.
+fn ttl_extend_for_window(window_secs: u64) -> u32 {
+    let ledgers = window_secs / SECS_PER_LEDGER;
     let capped = if ledgers > u32::MAX as u64 {
         u32::MAX
     } else {
@@ -147,11 +149,22 @@ fn ttl_extend_for_period(period_secs: u64) -> u32 {
     core::cmp::max(capped, PERSISTENT_TTL_EXTEND_MIN)
 }
 
-fn bump_persistent(env: &Env, key: &DataKey, period_secs: u64) {
+/// LIB-7: TTL window for keys whose next re-bump is the first post-trial /
+/// post-period `process()` call. Trial-bearing keys (Sub, SubServicePair,
+/// TrialUsed, ServiceSubs/SubscriberSubs entries, Service) must outlive the
+/// trial window plus one full billing period of slack, otherwise the chain
+/// can forget the subscription before the first paid charge ever lands.
+/// Reduces to `2 * period_secs` when `trial_period_secs == 0`, preserving the
+/// non-trial behavior the contract had before.
+fn sub_ttl_window_secs(period_secs: u64, trial_period_secs: u64) -> u64 {
+    period_secs.saturating_add(core::cmp::max(period_secs, trial_period_secs))
+}
+
+fn bump_persistent(env: &Env, key: &DataKey, window_secs: u64) {
     env.storage().persistent().extend_ttl(
         key,
         PERSISTENT_TTL_THRESHOLD,
-        ttl_extend_for_period(period_secs),
+        ttl_extend_for_window(window_secs),
     );
 }
 
@@ -287,7 +300,7 @@ fn paginated_append<F>(
     page_key_fn: F,
     count_key: &DataKey,
     item: u64,
-    period_secs: u64,
+    window_secs: u64,
 ) -> u32
 where
     F: Fn(u32) -> DataKey,
@@ -302,9 +315,9 @@ where
         .unwrap_or_else(|| Vec::new(env));
     page.push_back(item);
     env.storage().persistent().set(&page_key, &page);
-    bump_persistent(env, &page_key, period_secs);
+    bump_persistent(env, &page_key, window_secs);
     env.storage().persistent().set(count_key, &(count + 1));
-    bump_persistent(env, count_key, period_secs);
+    bump_persistent(env, count_key, window_secs);
     page_idx
 }
 
@@ -319,7 +332,7 @@ fn paginated_remove<F>(
     count_key: &DataKey,
     target: u64,
     target_page: u32,
-    period_secs: u64,
+    window_secs: u64,
 ) -> Option<(u64, u32)>
 where
     F: Fn(u32) -> DataKey,
@@ -360,7 +373,7 @@ where
             env.storage().persistent().remove(&target_page_key);
         } else {
             env.storage().persistent().set(&target_page_key, &target_page_vec);
-            bump_persistent(env, &target_page_key, period_secs);
+            bump_persistent(env, &target_page_key, window_secs);
         }
         // Movement was within the same page, so reverse pointer is unchanged.
         None
@@ -374,21 +387,21 @@ where
 
         target_page_vec.set(target_idx, last_item);
         env.storage().persistent().set(&target_page_key, &target_page_vec);
-        bump_persistent(env, &target_page_key, period_secs);
+        bump_persistent(env, &target_page_key, window_secs);
 
         last_page_vec.pop_back();
         if last_page_vec.is_empty() {
             env.storage().persistent().remove(&last_page_key);
         } else {
             env.storage().persistent().set(&last_page_key, &last_page_vec);
-            bump_persistent(env, &last_page_key, period_secs);
+            bump_persistent(env, &last_page_key, window_secs);
         }
 
         Some((last_item, target_page))
     };
 
     env.storage().persistent().set(count_key, &(count - 1));
-    bump_persistent(env, count_key, period_secs);
+    bump_persistent(env, count_key, window_secs);
 
     moved
 }
@@ -509,9 +522,10 @@ impl SubscriptionContract {
             created_at: now,
         };
 
+        let svc_window = sub_ttl_window_secs(period_secs, trial_period_secs);
         let svc_key = DataKey::Service(service_id);
         env.storage().persistent().set(&svc_key, &service);
-        bump_persistent(&env, &svc_key, period_secs);
+        bump_persistent(&env, &svc_key, svc_window);
 
         // Append to merchant's paginated service index
         let merchant_for_pages = merchant.clone();
@@ -521,7 +535,7 @@ impl SubscriptionContract {
             |p| DataKey::MerchantServicesPage(merchant_for_pages.clone(), p),
             &count_key,
             service_id,
-            period_secs,
+            svc_window,
         );
 
         bump_instance(&env);
@@ -558,7 +572,11 @@ impl SubscriptionContract {
 
         service.is_active = active;
         env.storage().persistent().set(&svc_key, &service);
-        bump_persistent(&env, &svc_key, service.period_secs);
+        bump_persistent(
+            &env,
+            &svc_key,
+            sub_ttl_window_secs(service.period_secs, service.trial_period_secs),
+        );
         bump_instance(&env);
 
         env.events()
@@ -607,7 +625,8 @@ impl SubscriptionContract {
             .persistent()
             .get(&svc_key)
             .ok_or(ContractError::ServiceNotFound)?;
-        bump_persistent(&env, &svc_key, service.period_secs);
+        let svc_window = sub_ttl_window_secs(service.period_secs, service.trial_period_secs);
+        bump_persistent(&env, &svc_key, svc_window);
 
         if !service.is_active {
             return Err(ContractError::ServiceNotActive);
@@ -617,7 +636,7 @@ impl SubscriptionContract {
         let trial_used_key = DataKey::TrialUsed(subscriber.clone(), service_id);
         let mut had_trial = env.storage().persistent().has(&trial_used_key);
         if had_trial {
-            bump_persistent(&env, &trial_used_key, service.period_secs);
+            bump_persistent(&env, &trial_used_key, svc_window);
         }
 
         // ---- Dedup check ----
@@ -628,10 +647,14 @@ impl SubscriptionContract {
         let pair_key = DataKey::SubServicePair(subscriber.clone(), service_id);
         let mut prior_sub_to_prune: Option<u64> = None;
         if let Some(existing_sub_id) = env.storage().persistent().get::<_, u64>(&pair_key) {
-            bump_persistent(&env, &pair_key, service.period_secs);
+            bump_persistent(&env, &pair_key, svc_window);
             let sub_key = DataKey::Sub(existing_sub_id);
             if let Some(existing) = env.storage().persistent().get::<_, Subscription>(&sub_key) {
-                bump_persistent(&env, &sub_key, existing.period_secs);
+                bump_persistent(
+                    &env,
+                    &sub_key,
+                    sub_ttl_window_secs(existing.period_secs, existing.trial_period_secs),
+                );
                 if existing.auto_renew || env.ledger().timestamp() < existing.service_end_ts {
                     return Err(ContractError::AlreadySubscribed);
                 }
@@ -657,7 +680,7 @@ impl SubscriptionContract {
             // Mark trial as consumed before any external calls so the flag
             // sticks regardless of subsequent cancel() or allowance revocation.
             env.storage().persistent().set(&trial_used_key, &true);
-            bump_persistent(&env, &trial_used_key, service.period_secs);
+            bump_persistent(&env, &trial_used_key, svc_window);
 
             if auto_renew {
                 // Trial + auto_renew: approve for future periods. Allowance
@@ -723,13 +746,16 @@ impl SubscriptionContract {
         };
 
         // ---- Persist subscription ----
-        let ps = service.period_secs;
+        // LIB-7: window must cover the trial leg too — the next bump on these
+        // keys is the post-trial process() call, which may be `trial_period`
+        // away on the new sub.
+        let new_window = sub_ttl_window_secs(sub.period_secs, sub.trial_period_secs);
         let sub_key = DataKey::Sub(sub_id);
         env.storage().persistent().set(&sub_key, &sub);
-        bump_persistent(&env, &sub_key, ps);
+        bump_persistent(&env, &sub_key, new_window);
 
         env.storage().persistent().set(&pair_key, &sub_id);
-        bump_persistent(&env, &pair_key, ps);
+        bump_persistent(&env, &pair_key, new_window);
 
         // Prune the dead prior sub_id from the indexes before appending the
         // new one. Without this, every re-subscribe cycle would leave a
@@ -746,7 +772,7 @@ impl SubscriptionContract {
                     &DataKey::ServiceSubsCount(svc_id_for_pages),
                     old_sub_id,
                     old_idx.service_page,
-                    ps,
+                    new_window,
                 );
                 if let Some((moved_id, new_page)) = moved_in_service {
                     let moved_key = DataKey::SubIndex(moved_id);
@@ -755,7 +781,7 @@ impl SubscriptionContract {
                     {
                         moved_idx.service_page = new_page;
                         env.storage().persistent().set(&moved_key, &moved_idx);
-                        bump_persistent(&env, &moved_key, ps);
+                        bump_persistent(&env, &moved_key, new_window);
                     }
                 }
 
@@ -766,7 +792,7 @@ impl SubscriptionContract {
                     &DataKey::SubscriberSubsCount(subscriber.clone()),
                     old_sub_id,
                     old_idx.subscriber_page,
-                    ps,
+                    new_window,
                 );
                 if let Some((moved_id, new_page)) = moved_in_subscriber {
                     let moved_key = DataKey::SubIndex(moved_id);
@@ -775,7 +801,7 @@ impl SubscriptionContract {
                     {
                         moved_idx.subscriber_page = new_page;
                         env.storage().persistent().set(&moved_key, &moved_idx);
-                        bump_persistent(&env, &moved_key, ps);
+                        bump_persistent(&env, &moved_key, new_window);
                     }
                 }
 
@@ -793,7 +819,7 @@ impl SubscriptionContract {
             |p| DataKey::SubscriberSubsPage(subscriber_for_sub_pages.clone(), p),
             &DataKey::SubscriberSubsCount(subscriber.clone()),
             sub_id,
-            ps,
+            new_window,
         );
 
         // Append to service's paginated subscriber index
@@ -802,7 +828,7 @@ impl SubscriptionContract {
             |p| DataKey::ServiceSubsPage(service_id, p),
             &DataKey::ServiceSubsCount(service_id),
             sub_id,
-            ps,
+            new_window,
         );
 
         // Reverse pointer so cancel/re-subscribe can locate this entry
@@ -814,7 +840,7 @@ impl SubscriptionContract {
                 subscriber_page,
             },
         );
-        bump_persistent(&env, &idx_key, ps);
+        bump_persistent(&env, &idx_key, new_window);
 
         bump_instance(&env);
 
@@ -843,7 +869,11 @@ impl SubscriptionContract {
 
         sub.auto_renew = false;
         env.storage().persistent().set(&sub_key, &sub);
-        bump_persistent(&env, &sub_key, sub.period_secs);
+        bump_persistent(
+            &env,
+            &sub_key,
+            sub_ttl_window_secs(sub.period_secs, sub.trial_period_secs),
+        );
 
         // Smart revoke: clear the on-chain allowance once this subscriber has
         // no other auto-renewing subs in this contract. Allowance is per
@@ -900,8 +930,9 @@ impl SubscriptionContract {
 
         // Persist the flip before the allowance call so any_active_auto_renew
         // sees the up-to-date flag for *this* sub.
+        let sub_window = sub_ttl_window_secs(sub.period_secs, sub.trial_period_secs);
         env.storage().persistent().set(&sub_key, &sub);
-        bump_persistent(&env, &sub_key, sub.period_secs);
+        bump_persistent(&env, &sub_key, sub_window);
 
         if sub.auto_renew {
             // Re-enabling: refresh the token approval so process() can charge.
@@ -913,7 +944,11 @@ impl SubscriptionContract {
                 .ok_or(ContractError::ServiceNotFound)?;
 
             do_approve(&env, &subscriber, &service, service.approve_periods)?;
-            bump_persistent(&env, &svc_key, sub.period_secs);
+            bump_persistent(
+                &env,
+                &svc_key,
+                sub_ttl_window_secs(service.period_secs, service.trial_period_secs),
+            );
         } else if !any_active_auto_renew(&env, &subscriber) {
             // Disabling and no other sub still needs the allowance — clear it.
             do_revoke_approval(&env, &subscriber);
@@ -968,8 +1003,13 @@ impl SubscriptionContract {
 
         sub.auto_renew = true;
         env.storage().persistent().set(&sub_key, &sub);
-        bump_persistent(&env, &sub_key, sub.period_secs);
-        bump_persistent(&env, &svc_key, sub.period_secs);
+        let svc_window = sub_ttl_window_secs(service.period_secs, service.trial_period_secs);
+        bump_persistent(
+            &env,
+            &sub_key,
+            sub_ttl_window_secs(sub.period_secs, sub.trial_period_secs),
+        );
+        bump_persistent(&env, &svc_key, svc_window);
         bump_instance(&env);
 
         env.events().publish(
@@ -999,7 +1039,8 @@ impl SubscriptionContract {
         if service.merchant != merchant {
             return Err(ContractError::NotServiceOwner);
         }
-        bump_persistent(&env, &svc_key, service.period_secs);
+        let svc_window = sub_ttl_window_secs(service.period_secs, service.trial_period_secs);
+        bump_persistent(&env, &svc_key, svc_window);
 
         let token = get_token(&env);
         let token_client = TokenClient::new(&env, &token);
@@ -1011,7 +1052,7 @@ impl SubscriptionContract {
         let count_key = DataKey::ServiceSubsCount(service_id);
         let count: u64 = env.storage().persistent().get(&count_key).unwrap_or(0);
         if count > 0 {
-            bump_persistent(&env, &count_key, service.period_secs);
+            bump_persistent(&env, &count_key, svc_window);
         }
         let total: u32 = if count > u32::MAX as u64 {
             u32::MAX
@@ -1034,7 +1075,7 @@ impl SubscriptionContract {
                 let page_key = DataKey::ServiceSubsPage(service_id, p);
                 let page: Vec<u64> = match env.storage().persistent().get(&page_key) {
                     Some(v) => {
-                        bump_persistent(&env, &page_key, service.period_secs);
+                        bump_persistent(&env, &page_key, svc_window);
                         v
                     }
                     None => break 'pages,
@@ -1085,7 +1126,11 @@ impl SubscriptionContract {
                                 // Overflow: disable auto-renew rather than reverting the batch
                                 sub.auto_renew = false;
                                 env.storage().persistent().set(&sub_key, &sub);
-                                bump_persistent(&env, &sub_key, sub.period_secs);
+                                bump_persistent(
+                                    &env,
+                                    &sub_key,
+                                    sub_ttl_window_secs(sub.period_secs, sub.trial_period_secs),
+                                );
                                 failed += 1;
                                 env.events().publish(
                                     (symbol_short!("chg_fail"),),
@@ -1097,7 +1142,11 @@ impl SubscriptionContract {
                         sub.next_charge_ts = new_next;
                         sub.service_end_ts = new_next;
                         env.storage().persistent().set(&sub_key, &sub);
-                        bump_persistent(&env, &sub_key, sub.period_secs);
+                        bump_persistent(
+                            &env,
+                            &sub_key,
+                            sub_ttl_window_secs(sub.period_secs, sub.trial_period_secs),
+                        );
                         charged += 1;
 
                         env.events().publish(
@@ -1139,7 +1188,11 @@ impl SubscriptionContract {
                     } else {
                         sub.auto_renew = false;
                         env.storage().persistent().set(&sub_key, &sub);
-                        bump_persistent(&env, &sub_key, sub.period_secs);
+                        bump_persistent(
+                            &env,
+                            &sub_key,
+                            sub_ttl_window_secs(sub.period_secs, sub.trial_period_secs),
+                        );
                         failed += 1;
 
                         env.events().publish(
