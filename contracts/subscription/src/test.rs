@@ -1080,11 +1080,21 @@ mod upgrade_wasm {
     soroban_sdk::contractimport!(file = "../../target/wasm32v1-none/release/subscription.wasm");
 }
 
+/// Hard-coded mirror of `UPGRADE_TIMELOCK_SECS` in lib.rs. The contract
+/// constant is private — keeping a copy here avoids leaking it via `pub`.
+/// If the constant changes, this and the `+ 1` waits below must too.
+const UPGRADE_TIMELOCK_SECS: u64 = 7 * 24 * 60 * 60;
+
 #[test]
 fn test_upgrade() {
     let s = setup();
     let wasm_hash = s.env.deployer().upload_contract_wasm(upgrade_wasm::WASM);
-    s.client.upgrade(&wasm_hash);
+
+    // LIB-13: upgrade is now propose -> wait timelock -> apply.
+    s.client.propose_upgrade(&wasm_hash);
+    advance_time(&s.env, UPGRADE_TIMELOCK_SECS + 1);
+    s.client.apply_upgrade();
+
     assert_eq!(s.client.version(), 1);
 }
 
@@ -1092,6 +1102,109 @@ fn test_upgrade() {
 fn test_version() {
     let s = setup();
     assert_eq!(s.client.version(), 1);
+}
+
+// ===========================================================================
+// Upgrade governance (LIB-13: timelocked propose / apply / cancel)
+// ===========================================================================
+
+#[test]
+fn test_propose_upgrade_records_pending_with_timelocked_eta() {
+    // LIB-13 regression: propose_upgrade must publish a pending entry with
+    // apply_after_ts = now + UPGRADE_TIMELOCK_SECS. Subscribers who watch
+    // the on-chain state (or the up_prop event) need this to know how long
+    // they have to revoke their token allowances before any new bytecode
+    // can replace this contract.
+    let s = setup();
+    let wasm_hash = s.env.deployer().upload_contract_wasm(upgrade_wasm::WASM);
+
+    let now = s.env.ledger().timestamp();
+    let pending = s.client.propose_upgrade(&wasm_hash);
+
+    assert_eq!(pending.wasm_hash, wasm_hash);
+    assert_eq!(pending.apply_after_ts, now + UPGRADE_TIMELOCK_SECS);
+
+    let stored = s.client.get_pending_upgrade();
+    assert_eq!(stored, Some(pending));
+}
+
+#[test]
+fn test_apply_upgrade_before_timelock_fails() {
+    // LIB-13 regression: an admin (or compromised key) must not be able to
+    // skip the public delay. Even one second short of apply_after_ts must
+    // revert with UpgradeTimelockNotElapsed.
+    let s = setup();
+    let wasm_hash = s.env.deployer().upload_contract_wasm(upgrade_wasm::WASM);
+
+    s.client.propose_upgrade(&wasm_hash);
+
+    advance_time(&s.env, UPGRADE_TIMELOCK_SECS - 1);
+    let early = s.client.try_apply_upgrade();
+    assert_eq!(early, Err(Ok(ContractError::UpgradeTimelockNotElapsed)));
+
+    // Boundary check: exactly at apply_after_ts the apply succeeds (the
+    // contract uses `<` for the guard, not `<=`).
+    advance_time(&s.env, UPGRADE_TIMELOCK_SECS);
+    s.client.apply_upgrade();
+    assert_eq!(s.client.get_pending_upgrade(), None);
+}
+
+#[test]
+fn test_apply_upgrade_with_no_proposal_fails() {
+    let s = setup();
+    let result = s.client.try_apply_upgrade();
+    assert_eq!(result, Err(Ok(ContractError::NoUpgradeProposed)));
+}
+
+#[test]
+fn test_repropose_upgrade_while_pending_is_rejected() {
+    // LIB-13 regression: once a proposal is staged, a second propose_upgrade
+    // call must NOT silently overwrite it (which would let a hostile or
+    // careless actor reset the timelock and slip in a different hash). The
+    // admin has to cancel_upgrade first, making the replacement explicit
+    // and visible on chain.
+    let s = setup();
+    let first = s.env.deployer().upload_contract_wasm(upgrade_wasm::WASM);
+    let second = s.env.deployer().upload_contract_wasm(upgrade_wasm::WASM);
+
+    s.client.propose_upgrade(&first);
+
+    let blocked = s.client.try_propose_upgrade(&second);
+    assert_eq!(blocked, Err(Ok(ContractError::UpgradeAlreadyPending)));
+
+    // The original proposal must be intact.
+    let stored = s.client.get_pending_upgrade().unwrap();
+    assert_eq!(stored.wasm_hash, first);
+}
+
+#[test]
+fn test_cancel_upgrade_clears_pending_and_allows_repropose() {
+    let s = setup();
+    let first = s.env.deployer().upload_contract_wasm(upgrade_wasm::WASM);
+    let second = s.env.deployer().upload_contract_wasm(upgrade_wasm::WASM);
+
+    s.client.propose_upgrade(&first);
+    s.client.cancel_upgrade();
+    assert_eq!(s.client.get_pending_upgrade(), None);
+
+    // After cancel, re-proposing works and starts a fresh timelock.
+    let now = s.env.ledger().timestamp();
+    let pending = s.client.propose_upgrade(&second);
+    assert_eq!(pending.wasm_hash, second);
+    assert_eq!(pending.apply_after_ts, now + UPGRADE_TIMELOCK_SECS);
+}
+
+#[test]
+fn test_cancel_upgrade_with_no_proposal_fails() {
+    let s = setup();
+    let result = s.client.try_cancel_upgrade();
+    assert_eq!(result, Err(Ok(ContractError::NoUpgradeProposed)));
+}
+
+#[test]
+fn test_get_pending_upgrade_is_none_initially() {
+    let s = setup();
+    assert_eq!(s.client.get_pending_upgrade(), None);
 }
 
 // ===========================================================================
@@ -1114,7 +1227,9 @@ fn test_admin_rotation_two_step_completes() {
     // panic if Admin still pointed at the old address (mock_all_auths
     // doesn't relax the storage-equality the contract reads).
     let wasm_hash = s.env.deployer().upload_contract_wasm(upgrade_wasm::WASM);
-    s.client.upgrade(&wasm_hash);
+    s.client.propose_upgrade(&wasm_hash);
+    advance_time(&s.env, UPGRADE_TIMELOCK_SECS + 1);
+    s.client.apply_upgrade();
 }
 
 #[test]
@@ -1173,7 +1288,9 @@ fn test_old_admin_loses_role_after_rotation() {
 
     // Sanity: third can upgrade.
     let wasm_hash = s.env.deployer().upload_contract_wasm(upgrade_wasm::WASM);
-    s.client.upgrade(&wasm_hash);
+    s.client.propose_upgrade(&wasm_hash);
+    advance_time(&s.env, UPGRADE_TIMELOCK_SECS + 1);
+    s.client.apply_upgrade();
 }
 
 // ===========================================================================

@@ -18,6 +18,15 @@ const SECS_PER_LEDGER: u64 = 5;
 // constant-sized entry instead of the full historical set.
 const PAGE_SIZE: u32 = 50;
 
+// LIB-13: minimum delay between proposing and applying a contract upgrade.
+// Subscribers approve this contract as a token spender, so a malicious or
+// compromised admin pushing new WASM can immediately rewrite billing logic
+// or drain existing allowances. The timelock + on-chain `up_prop` event
+// gives users a known window to revoke their allowances before any new
+// bytecode takes effect. 7 days is the same order of magnitude as typical
+// DeFi upgrade timelocks and well above the simulate→execute drift.
+const UPGRADE_TIMELOCK_SECS: u64 = 7 * 24 * 60 * 60;
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -39,6 +48,9 @@ pub enum ContractError {
     ServiceNotActive = 12,
     NoAdminProposed = 13,
     NotProposedAdmin = 14,
+    NoUpgradeProposed = 15,
+    UpgradeTimelockNotElapsed = 16,
+    UpgradeAlreadyPending = 17,
 }
 
 // ---------------------------------------------------------------------------
@@ -50,6 +62,7 @@ pub enum DataKey {
     // Instance storage
     Admin,
     PendingAdmin,
+    PendingUpgrade,
     Token,
     NextServiceId,
     NextSubId,
@@ -126,6 +139,16 @@ pub struct ProcessResult {
 pub struct SubIndex {
     pub service_page: u32,
     pub subscriber_page: u32,
+}
+
+/// LIB-13: a queued contract upgrade. Public via `get_pending_upgrade()` so
+/// off-chain watchers can inspect the staged WASM hash and the earliest
+/// ledger timestamp at which it can be applied.
+#[derive(Clone, PartialEq, Debug)]
+#[contracttype]
+pub struct PendingUpgrade {
+    pub wasm_hash: BytesN<32>,
+    pub apply_after_ts: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1456,15 +1479,105 @@ impl SubscriptionContract {
         Ok(())
     }
 
-    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+    /// LIB-13: stage a contract upgrade. Records the candidate WASM hash
+    /// alongside an `apply_after_ts` exactly `UPGRADE_TIMELOCK_SECS` into the
+    /// future and emits `up_prop` so subscribers (who have approved this
+    /// contract as a token spender) get a known window to revoke their
+    /// allowances before any new bytecode runs. Rejects if a proposal is
+    /// already pending — `cancel_upgrade()` must run first to replace it,
+    /// which prevents a hostile or careless re-propose from silently
+    /// resetting the timelock.
+    pub fn propose_upgrade(
+        env: Env,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<PendingUpgrade, ContractError> {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
+
+        if env.storage().instance().has(&DataKey::PendingUpgrade) {
+            return Err(ContractError::UpgradeAlreadyPending);
+        }
+
+        let apply_after_ts = env
+            .ledger()
+            .timestamp()
+            .checked_add(UPGRADE_TIMELOCK_SECS)
+            .ok_or(ContractError::TimestampOverflow)?;
+
+        let pending = PendingUpgrade {
+            wasm_hash: new_wasm_hash,
+            apply_after_ts,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingUpgrade, &pending);
+        bump_instance(&env);
+
+        env.events().publish(
+            (symbol_short!("up_prop"),),
+            (admin, pending.wasm_hash.clone(), apply_after_ts),
+        );
+
+        Ok(pending)
+    }
+
+    /// LIB-13: apply the staged upgrade once the timelock has elapsed.
+    /// Reverts if no proposal exists or if the timelock window has not
+    /// passed yet, so the audit's compromised-admin path can never bypass
+    /// the public delay.
+    pub fn apply_upgrade(env: Env) -> Result<(), ContractError> {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        let pending: PendingUpgrade = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpgrade)
+            .ok_or(ContractError::NoUpgradeProposed)?;
+
+        if env.ledger().timestamp() < pending.apply_after_ts {
+            return Err(ContractError::UpgradeTimelockNotElapsed);
+        }
+
         env.deployer()
-            .update_current_contract_wasm(new_wasm_hash.clone());
+            .update_current_contract_wasm(pending.wasm_hash.clone());
+        env.storage().instance().remove(&DataKey::PendingUpgrade);
         bump_instance(&env);
 
         env.events()
-            .publish((symbol_short!("upgrade"),), new_wasm_hash);
+            .publish((symbol_short!("up_apply"),), pending.wasm_hash);
+
+        Ok(())
+    }
+
+    /// LIB-13: drop a pending upgrade proposal. Lets the admin abort a
+    /// proposal mid-timelock if a problem with the candidate WASM is
+    /// found, and lets a freshly-rotated admin clear an inherited
+    /// proposal they did not author.
+    pub fn cancel_upgrade(env: Env) -> Result<(), ContractError> {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        let pending: PendingUpgrade = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpgrade)
+            .ok_or(ContractError::NoUpgradeProposed)?;
+
+        env.storage().instance().remove(&DataKey::PendingUpgrade);
+        bump_instance(&env);
+
+        env.events()
+            .publish((symbol_short!("up_cancl"),), (admin, pending.wasm_hash));
+
+        Ok(())
+    }
+
+    /// Read the currently-pending upgrade, if any. No auth — proposers,
+    /// subscribers and off-chain watchers all have a legitimate reason to
+    /// inspect the staged hash and earliest-apply timestamp.
+    pub fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
+        env.storage().instance().get(&DataKey::PendingUpgrade)
     }
 
     pub fn version(_env: Env) -> u32 {
