@@ -276,11 +276,11 @@ fn do_approve(
         .checked_add(this_sub_amount)
         .ok_or(ContractError::TimestampOverflow)?;
 
-    // Use the network's max ttl unconditionally so a later approve with a
-    // shorter period_secs cannot truncate the existing budget's window.
-    // The user's revoke path (cancel / toggle off) already clears this in
-    // a tight cancellation boundary, so the wider window is bounded by
-    // the user's explicit lifecycle, not by max_ttl alone.
+    // Allowance expiration is set to nearly max_ttl (see
+    // compute_approval_expiration) so a later approve from a shorter-lived
+    // sub cannot truncate the budget's live-until under the longest
+    // currently-active sub. The user's explicit cancel / toggle-off path
+    // is what bounds the on-chain allowance lifetime, not this expiration.
     let expiration_ledger = compute_approval_expiration(env);
 
     token_client.approve(
@@ -363,8 +363,13 @@ fn do_reduce_approval(env: &Env, subscriber: &Address, amount: i128) {
     } else {
         let expiration_ledger = compute_approval_expiration(env);
         token_client.approve(subscriber, &contract_addr, &new_amount, &expiration_ledger);
+        // Distinct topic from "approve" (which signals an explicit user
+        // top-up via subscribe / extend / toggle_on). "alw_red" is the
+        // contract reducing the (subscriber, contract) allowance as part
+        // of cancel / toggle_off, so an indexer keyed on "approve" doesn't
+        // see a payload-shape mismatch.
         env.events().publish(
-            (symbol_short!("approve"),),
+            (symbol_short!("alw_red"),),
             (
                 subscriber.clone(),
                 new_amount,
@@ -868,12 +873,15 @@ impl SubscriptionContract {
             // The prior Subscription record itself is now unreachable from
             // any index — drop it so storage doesn't accumulate dead subs.
             env.storage().persistent().remove(&DataKey::Sub(old_sub_id));
-            // LIB-8 (full fix): drop the prior sub's reservation key too.
-            // It should already be zero (cancel/toggle-off cleared it) but
-            // explicit removal keeps the prune sweep complete.
-            env.storage()
-                .persistent()
-                .remove(&DataKey::SubReservedAmount(old_sub_id));
+            // LIB-8 (full fix): release the prior sub's reservation against
+            // the on-chain allowance. cancel() / toggle_off() normally drain
+            // both already, but a sub deactivated via process() charge
+            // failure keeps its reservation (process can't approve without
+            // subscriber auth). Re-subscribe is the next subscriber-authed
+            // touch point, so this is where we honor the invariant: the
+            // dead sub's share gets removed from the (subscriber, contract)
+            // allowance before the new sub stacks its own share on top.
+            release_sub_reservation(&env, &subscriber, old_sub_id);
         }
 
         // Append to subscriber's paginated index
@@ -1275,6 +1283,14 @@ impl SubscriptionContract {
                             );
                         }
                     } else {
+                        // LIB-8 (full fix) limitation: process() runs under
+                        // merchant auth, not subscriber auth, so we cannot
+                        // call token.approve here to release the dead sub's
+                        // SubReservedAmount share against the on-chain
+                        // allowance. The reservation key lingers until the
+                        // subscriber's next authed touch (cancel / toggle /
+                        // extend / re-subscribe), at which point the
+                        // matching path drains it.
                         sub.auto_renew = false;
                         env.storage().persistent().set(&sub_key, &sub);
                         bump_persistent(

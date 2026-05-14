@@ -1719,6 +1719,62 @@ fn test_resubscribe_after_cancel_does_not_double_count_reservation() {
 }
 
 #[test]
+fn test_resubscribe_after_charge_failure_releases_orphan_reservation() {
+    // LIB-8 (full fix) prune-path regression: when process() fails to
+    // charge a sub, it sets auto_renew=false but cannot reduce the on-chain
+    // allowance — process runs under merchant auth, not subscriber auth, so
+    // it can't call token.approve. The reservation key and the on-chain
+    // share linger until the subscriber's next authed touch.
+    //
+    // The audit-spec'd cleanup happens on re-subscribe: that's a
+    // subscriber-authed call where the prune sweep can legally release the
+    // dead sub's allowance share. Without the fix the prune just drops the
+    // SubReservedAmount key, orphaning the on-chain budget so it stacks on
+    // top of every future sub.
+    let s = setup();
+    let svc = register_default_service(&s); // PRICE * 12 = 12_000
+
+    let sub1 = s.client.subscribe(&s.subscriber, &svc.service_id, &true);
+    assert_eq!(
+        s.token.allowance(&s.subscriber, &s.contract_addr),
+        12 * PRICE
+    );
+
+    // Drain the subscriber's balance so the next charge attempt fails.
+    let drain_to: i128 = 5;
+    let sink = Address::generate(&s.env);
+    let to_drain = s.token.balance(&s.subscriber) - drain_to;
+    s.token.transfer(&s.subscriber, &sink, &to_drain);
+
+    advance_time(&s.env, MONTH + 1);
+    let r = s.client.process(&s.merchant, &svc.service_id, &0, &10);
+    assert_eq!(r.failed, 1);
+    // Sub is now auto_renew=false, but the on-chain allowance is unchanged
+    // (process can't approve from the subscriber, only the contract).
+    assert_eq!(
+        s.token.allowance(&s.subscriber, &s.contract_addr),
+        12 * PRICE
+    );
+
+    // Refund the subscriber and let the failed sub's service_end_ts pass so
+    // the SubServicePair routes through the prune path on re-subscribe.
+    s.token_admin.mint(&s.subscriber, &INITIAL_BALANCE);
+    advance_time(&s.env, 3 * MONTH);
+
+    let _sub2 = s.client.subscribe(&s.subscriber, &svc.service_id, &true);
+
+    // With the fix: the prune path called release_sub_reservation on sub1
+    // before sub2's do_approve added 12 * PRICE on top, so the allowance
+    // ends at exactly 12 * PRICE.
+    // Without the fix: orphan (12_000) + new (12_000) = 24_000.
+    assert_eq!(
+        s.token.allowance(&s.subscriber, &s.contract_addr),
+        12 * PRICE
+    );
+    let _ = sub1; // sub1 binding only used to keep the storage alive above.
+}
+
+#[test]
 fn test_resubscribe_cross_page_swap_updates_reverse_pointer() {
     // When pruning a sub from a non-tail page, the global tail is moved
     // into the freed slot — its reverse pointer (SubIndex.service_page)
