@@ -70,6 +70,13 @@ pub enum DataKey {
     // ServiceSubs/SubscriberSubs. Lets cancel/re-subscribe locate and
     // remove the entry without scanning every page.
     SubIndex(u64),
+    // LIB-8 (full fix): per-sub allowance reservation. Mirrors the share of
+    // the (subscriber, contract) on-chain allowance contributed by this sub.
+    // Incremented on every do_approve(sub_id), decremented by sub.price on
+    // each successful charge, drained on cancel / toggle-off. Lets us reduce
+    // the contract's allowance by exactly the cancelled sub's contribution
+    // when the subscriber keeps other auto-renewing subs alive.
+    SubReservedAmount(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -198,9 +205,33 @@ fn get_token(env: &Env) -> Address {
     env.storage().instance().get(&DataKey::Token).unwrap()
 }
 
+/// LIB-10: pick an allowance expiration ledger that sits one bucket below the
+/// network's max_ttl, rounded UP to a bucket boundary. Rounding up keeps the
+/// value strictly above `seq` for short windows; the bucket gap absorbs the
+/// drift between simulate→execute so a re-approval can't land in a smaller
+/// bucket than the previous one and shorten the live-until.
+fn compute_approval_expiration(env: &Env) -> u32 {
+    let max_ttl = env.storage().max_ttl();
+    let seq = env.ledger().sequence();
+    // 720 ledgers ≈ 1 hour — much larger than the simulate→execute gap (~seconds).
+    const LEDGER_BUCKET: u32 = 720;
+    if max_ttl <= LEDGER_BUCKET {
+        // Pathological: network max_ttl smaller than one bucket. Skip
+        // bucket rounding and use a direct value within SAC's limit.
+        seq.saturating_add(max_ttl.saturating_sub(1))
+    } else {
+        let target = seq.saturating_add(max_ttl - LEDGER_BUCKET);
+        target
+            .saturating_add(LEDGER_BUCKET - 1)
+            / LEDGER_BUCKET
+            * LEDGER_BUCKET
+    }
+}
+
 fn do_approve(
     env: &Env,
     subscriber: &Address,
+    sub_id: u64,
     service: &Service,
     periods: u64,
 ) -> Result<(), ContractError> {
@@ -227,33 +258,30 @@ fn do_approve(
     // The user's revoke path (cancel / toggle off) already clears this in
     // a tight cancellation boundary, so the wider window is bounded by
     // the user's explicit lifecycle, not by max_ttl alone.
-    let max_ttl = env.storage().max_ttl();
-    let seq = env.ledger().sequence();
-    // 720 ledgers ≈ 1 hour — much larger than the simulate→execute gap (~seconds).
-    const LEDGER_BUCKET: u32 = 720;
-    // LIB-10: round expiration UP to a bucket boundary, never down. The old
-    // floor could move expiration backward by up to LEDGER_BUCKET-1 ledgers
-    // and, with a short approval window, land at or before `seq` — writing
-    // an already-expired allowance. Aim for `max_ttl - LEDGER_BUCKET` so the
-    // upward rounding has room to grow without exceeding the SAC's
-    // `live_until - seq <= max_ttl` cap.
-    let expiration_ledger = if max_ttl <= LEDGER_BUCKET {
-        // Pathological: network max_ttl smaller than one bucket. Skip
-        // bucket rounding and use a direct value within SAC's limit.
-        seq.saturating_add(max_ttl.saturating_sub(1))
-    } else {
-        let target = seq.saturating_add(max_ttl - LEDGER_BUCKET);
-        target
-            .saturating_add(LEDGER_BUCKET - 1)
-            / LEDGER_BUCKET
-            * LEDGER_BUCKET
-    };
+    let expiration_ledger = compute_approval_expiration(env);
 
     token_client.approve(
         subscriber,
         &contract_addr,
         &approve_amount,
         &expiration_ledger,
+    );
+
+    // LIB-8 (full fix): mirror this sub's contribution into SubReservedAmount
+    // so cancel / toggle-off can later reduce the on-chain allowance by
+    // exactly this sub's share, even when other auto-renewing subs are alive.
+    // Add (not replace) so extend_subscription's top-up matches the on-chain
+    // add-on-top semantics above.
+    let reserved_key = DataKey::SubReservedAmount(sub_id);
+    let existing_reserved: i128 = env.storage().persistent().get(&reserved_key).unwrap_or(0);
+    let new_reserved = existing_reserved
+        .checked_add(this_sub_amount)
+        .ok_or(ContractError::TimestampOverflow)?;
+    env.storage().persistent().set(&reserved_key, &new_reserved);
+    bump_persistent(
+        env,
+        &reserved_key,
+        sub_ttl_window_secs(service.period_secs, service.trial_period_secs),
     );
 
     env.events().publish(
@@ -270,19 +298,58 @@ fn do_approve(
     Ok(())
 }
 
-/// Set the contract's allowance from `subscriber` to zero. Soroban's
-/// `approve(amount=0, expiration=0)` clears the entry entirely. Inner-
-/// invoked from `cancel()` / `toggle_auto_renew(off)` so revocation rides
-/// inside the same atomic auth tree the caller already signed for.
-fn do_revoke_approval(env: &Env, subscriber: &Address) {
+/// LIB-8 (full fix): release the sub's tracked allowance reservation. Reads
+/// SubReservedAmount for `sub_id`, reduces the on-chain allowance by exactly
+/// that share (clamped), then removes the reservation key. Idempotent and
+/// safe to call when no reservation exists (e.g. trial + !auto_renew subs).
+fn release_sub_reservation(env: &Env, subscriber: &Address, sub_id: u64) {
+    let reserved_key = DataKey::SubReservedAmount(sub_id);
+    let reserved: i128 = env.storage().persistent().get(&reserved_key).unwrap_or(0);
+    if reserved > 0 {
+        do_reduce_approval(env, subscriber, reserved);
+    }
+    env.storage().persistent().remove(&reserved_key);
+}
+
+/// LIB-8 (full fix): reduce the contract's allowance from `subscriber` by
+/// `amount`, clamped to what is currently on chain. If the resulting
+/// allowance is zero the entry is fully revoked (`approve(0, 0)` clears it);
+/// otherwise the entry is re-written with the same long expiration the
+/// approve path uses. Inner-invoked from `cancel()` / `toggle_auto_renew(off)`
+/// so the reduction rides inside the same atomic auth tree the caller signed.
+fn do_reduce_approval(env: &Env, subscriber: &Address, amount: i128) {
+    if amount <= 0 {
+        return;
+    }
+
     let token = get_token(env);
     let token_client = TokenClient::new(env, &token);
     let contract_addr = env.current_contract_address();
 
-    token_client.approve(subscriber, &contract_addr, &0i128, &0u32);
+    let current = token_client.allowance(subscriber, &contract_addr);
+    if current <= 0 {
+        return;
+    }
 
-    env.events()
-        .publish((symbol_short!("revoke"),), (subscriber.clone(), token));
+    let new_amount = current.saturating_sub(amount).max(0);
+
+    if new_amount == 0 {
+        token_client.approve(subscriber, &contract_addr, &0i128, &0u32);
+        env.events()
+            .publish((symbol_short!("revoke"),), (subscriber.clone(), token));
+    } else {
+        let expiration_ledger = compute_approval_expiration(env);
+        token_client.approve(subscriber, &contract_addr, &new_amount, &expiration_ledger);
+        env.events().publish(
+            (symbol_short!("approve"),),
+            (
+                subscriber.clone(),
+                new_amount,
+                expiration_ledger,
+                token,
+            ),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -432,38 +499,6 @@ where
         }
     }
     out
-}
-
-/// True if `subscriber` has any subscription whose `auto_renew` is still
-/// set — i.e. some other sub still needs the on-chain allowance. Reads
-/// from storage, so the caller must persist any flag flip *before* asking.
-/// Bounded by the user's actual sub count (typically tiny), iterated via
-/// the paginated SubscriberSubs index.
-fn any_active_auto_renew(env: &Env, subscriber: &Address) -> bool {
-    let count_key = DataKey::SubscriberSubsCount(subscriber.clone());
-    let count: u64 = env.storage().persistent().get(&count_key).unwrap_or(0);
-    if count == 0 {
-        return false;
-    }
-    let last_page_idx = ((count - 1) / PAGE_SIZE as u64) as u32;
-    for p in 0..=last_page_idx {
-        let page_key = DataKey::SubscriberSubsPage(subscriber.clone(), p);
-        if let Some(page) = env.storage().persistent().get::<_, Vec<u64>>(&page_key) {
-            for i in 0..page.len() {
-                let sid = page.get(i).unwrap();
-                if let Some(s) = env
-                    .storage()
-                    .persistent()
-                    .get::<_, Subscription>(&DataKey::Sub(sid))
-                {
-                    if s.auto_renew {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    false
 }
 
 // ---------------------------------------------------------------------------
@@ -685,7 +720,7 @@ impl SubscriptionContract {
             if auto_renew {
                 // Trial + auto_renew: approve for future periods. Allowance
                 // expiration uses max_ttl so the trial window is covered too.
-                do_approve(&env, &subscriber, &service, service.approve_periods)?;
+                do_approve(&env, &subscriber, sub_id, &service, service.approve_periods)?;
 
                 let balance = token_client.balance(&subscriber);
                 if balance < service.price {
@@ -715,7 +750,7 @@ impl SubscriptionContract {
 
             // Approve before transfer so the contract is pre-authorized
             let periods = if auto_renew { service.approve_periods } else { 1 };
-            do_approve(&env, &subscriber, &service, periods)?;
+            do_approve(&env, &subscriber, sub_id, &service, periods)?;
 
             // No trial – immediate first payment
             token_client.transfer(&subscriber, &service.merchant, &service.price);
@@ -810,6 +845,12 @@ impl SubscriptionContract {
             // The prior Subscription record itself is now unreachable from
             // any index — drop it so storage doesn't accumulate dead subs.
             env.storage().persistent().remove(&DataKey::Sub(old_sub_id));
+            // LIB-8 (full fix): drop the prior sub's reservation key too.
+            // It should already be zero (cancel/toggle-off cleared it) but
+            // explicit removal keeps the prune sweep complete.
+            env.storage()
+                .persistent()
+                .remove(&DataKey::SubReservedAmount(old_sub_id));
         }
 
         // Append to subscriber's paginated index
@@ -875,16 +916,15 @@ impl SubscriptionContract {
             sub_ttl_window_secs(sub.period_secs, sub.trial_period_secs),
         );
 
-        // Smart revoke: clear the on-chain allowance once this subscriber has
-        // no other auto-renewing subs in this contract. Allowance is per
-        // (subscriber, contract) — not per service — so unconditional revoke
-        // would also tear down billing for any other live subscription. By
-        // checking first, we keep the cancellation boundary tight for the
-        // single-sub case (the audit's main concern) without breaking
-        // multi-sub UX.
-        if !any_active_auto_renew(&env, &subscriber) {
-            do_revoke_approval(&env, &subscriber);
-        }
+        // LIB-8 (full fix): reduce the on-chain allowance by exactly this
+        // sub's tracked reservation. The token allowance is keyed by
+        // (subscriber, contract), not by sub, so we can't just revoke the
+        // whole entry without also tearing down billing for the user's other
+        // live subs. The per-sub SubReservedAmount lets us subtract just this
+        // sub's contribution; if that drains the entry it gets fully revoked,
+        // otherwise the remaining budget for the user's other subs is left
+        // intact.
+        release_sub_reservation(&env, &subscriber, sub_id);
 
         bump_instance(&env);
 
@@ -928,8 +968,6 @@ impl SubscriptionContract {
 
         sub.auto_renew = !sub.auto_renew;
 
-        // Persist the flip before the allowance call so any_active_auto_renew
-        // sees the up-to-date flag for *this* sub.
         let sub_window = sub_ttl_window_secs(sub.period_secs, sub.trial_period_secs);
         env.storage().persistent().set(&sub_key, &sub);
         bump_persistent(&env, &sub_key, sub_window);
@@ -943,15 +981,18 @@ impl SubscriptionContract {
                 .get(&svc_key)
                 .ok_or(ContractError::ServiceNotFound)?;
 
-            do_approve(&env, &subscriber, &service, service.approve_periods)?;
+            do_approve(&env, &subscriber, sub_id, &service, service.approve_periods)?;
             bump_persistent(
                 &env,
                 &svc_key,
                 sub_ttl_window_secs(service.period_secs, service.trial_period_secs),
             );
-        } else if !any_active_auto_renew(&env, &subscriber) {
-            // Disabling and no other sub still needs the allowance — clear it.
-            do_revoke_approval(&env, &subscriber);
+        } else {
+            // LIB-8 (full fix): reduce the on-chain allowance by this sub's
+            // tracked reservation. Per-sub bookkeeping means we no longer
+            // leak the cancelled sub's budget when other auto-renewing subs
+            // still depend on the same (subscriber, contract) allowance.
+            release_sub_reservation(&env, &subscriber, sub_id);
         }
 
         bump_instance(&env);
@@ -999,7 +1040,7 @@ impl SubscriptionContract {
             .get(&svc_key)
             .ok_or(ContractError::ServiceNotFound)?;
 
-        do_approve(&env, &subscriber, &service, service.approve_periods)?;
+        do_approve(&env, &subscriber, sub_id, &service, service.approve_periods)?;
 
         sub.auto_renew = true;
         env.storage().persistent().set(&sub_key, &sub);
@@ -1147,6 +1188,31 @@ impl SubscriptionContract {
                             &sub_key,
                             sub_ttl_window_secs(sub.period_secs, sub.trial_period_secs),
                         );
+
+                        // LIB-8 (full fix): mirror the on-chain allowance
+                        // debit by decrementing this sub's tracked
+                        // reservation. Keeps cancel/toggle-off's reduction
+                        // accurate as charges drain the budget. Clamps at
+                        // zero — if external state ever drifts below the
+                        // tracked value we don't want to roll negative.
+                        let reserved_key = DataKey::SubReservedAmount(sid);
+                        let cur_reserved: i128 = env
+                            .storage()
+                            .persistent()
+                            .get(&reserved_key)
+                            .unwrap_or(0);
+                        let new_reserved = (cur_reserved - sub.price).max(0);
+                        if new_reserved == 0 {
+                            env.storage().persistent().remove(&reserved_key);
+                        } else {
+                            env.storage().persistent().set(&reserved_key, &new_reserved);
+                            bump_persistent(
+                                &env,
+                                &reserved_key,
+                                sub_ttl_window_secs(sub.period_secs, sub.trial_period_secs),
+                            );
+                        }
+
                         charged += 1;
 
                         env.events().publish(

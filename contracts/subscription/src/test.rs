@@ -1357,12 +1357,17 @@ fn test_cancel_revokes_allowance_for_single_sub() {
 }
 
 #[test]
-fn test_cancel_preserves_allowance_when_other_sub_active() {
-    // Allowance is per (subscriber, contract), not per service. If we revoked
-    // unconditionally, cancelling one sub would also tear down billing for
-    // the user's other live subscriptions in this contract.
+fn test_cancel_reduces_allowance_by_only_cancelled_sub_share() {
+    // LIB-8 (full fix) regression: allowance is keyed by (subscriber,
+    // contract), not by service. The earlier partial fix preserved the FULL
+    // aggregate allowance whenever any other auto-renewing sub remained,
+    // leaving the cancelled sub's budget on chain and usable by future
+    // logic / a bad upgrade. The full fix tracks each sub's contribution
+    // (SubReservedAmount) and reduces the on-chain allowance by exactly
+    // that share — so the cancelled sub's budget goes away while the other
+    // sub's budget survives intact.
     let s = setup();
-    let svc1 = register_default_service(&s);
+    let svc1 = register_default_service(&s); // PRICE=1000, 12 periods => 12_000
     let svc2 = s.client.register_service(
         &s.merchant2,
         &String::from_str(&s.env, "Other Plan"),
@@ -1370,19 +1375,20 @@ fn test_cancel_preserves_allowance_when_other_sub_active() {
         &WEEK,
         &0,
         &12,
-    );
+    ); // 500 * 12 => 6_000
 
     let sub1 = s.client.subscribe(&s.subscriber, &svc1.service_id, &true);
     let _sub2 = s.client.subscribe(&s.subscriber, &svc2.service_id, &true);
 
     let allowance_after_both = s.token.allowance(&s.subscriber, &s.contract_addr);
-    assert!(allowance_after_both > 0);
+    assert_eq!(allowance_after_both, 12 * PRICE + 12 * 500); // 18_000
 
     s.client.cancel(&s.subscriber, &sub1.sub_id);
 
-    // sub2 is still auto-renewing, so the allowance must survive.
+    // Cancelled sub1's 12_000 budget must be removed; sub2's 6_000 must
+    // remain so its future renewals continue working.
     let allowance_after_cancel = s.token.allowance(&s.subscriber, &s.contract_addr);
-    assert_eq!(allowance_after_cancel, allowance_after_both);
+    assert_eq!(allowance_after_cancel, 12 * 500);
 }
 
 #[test]
@@ -1499,6 +1505,100 @@ fn test_toggle_auto_renew_back_on_restores_allowance() {
 
     s.client.toggle_auto_renew(&s.subscriber, &sub.sub_id);
     assert!(s.token.allowance(&s.subscriber, &s.contract_addr) > 0);
+}
+
+#[test]
+fn test_toggle_off_reduces_allowance_by_only_toggled_sub_share() {
+    // LIB-8 (full fix): the toggle-off path mirrors cancel — reduce the
+    // (subscriber, contract) allowance by exactly the toggled sub's
+    // reservation, leaving any other auto-renewing sub's budget intact.
+    let s = setup();
+    let svc1 = register_default_service(&s); // 12 * PRICE
+    let svc2 = s.client.register_service(
+        &s.merchant2,
+        &String::from_str(&s.env, "Other Plan"),
+        &500,
+        &WEEK,
+        &0,
+        &12,
+    ); // 12 * 500
+
+    let sub1 = s.client.subscribe(&s.subscriber, &svc1.service_id, &true);
+    s.client.subscribe(&s.subscriber, &svc2.service_id, &true);
+
+    s.client.toggle_auto_renew(&s.subscriber, &sub1.sub_id);
+
+    let allowance = s.token.allowance(&s.subscriber, &s.contract_addr);
+    assert_eq!(allowance, 12 * 500); // sub2's budget only
+}
+
+#[test]
+fn test_cancel_after_charges_reduces_only_remaining_reserved() {
+    // LIB-8 (full fix): SubReservedAmount is decremented on every successful
+    // process() charge, so cancel() removes only the *unused* portion of
+    // this sub's budget — not its original full reservation. Without that
+    // bookkeeping, cancel would over-remove and could drain the budget of
+    // other live subs sharing the (subscriber, contract) allowance.
+    let s = setup();
+    let svc1 = register_default_service(&s); // 12 * PRICE = 12_000 reserved
+    let svc2 = s.client.register_service(
+        &s.merchant2,
+        &String::from_str(&s.env, "Other"),
+        &500,
+        &MONTH,
+        &0,
+        &12,
+    ); // 12 * 500 = 6_000 reserved
+
+    let sub1 = s.client.subscribe(&s.subscriber, &svc1.service_id, &true);
+    s.client.subscribe(&s.subscriber, &svc2.service_id, &true);
+
+    // After subscribe (no process yet): full aggregate allowance.
+    assert_eq!(
+        s.token.allowance(&s.subscriber, &s.contract_addr),
+        12 * PRICE + 12 * 500
+    );
+
+    // Charge sub1 three times: reserved drops by 3 * PRICE, allowance too.
+    advance_time(&s.env, MONTH + 1);
+    s.client.process(&s.merchant, &svc1.service_id, &0, &10);
+    advance_time(&s.env, 2 * MONTH + 1);
+    s.client.process(&s.merchant, &svc1.service_id, &0, &10);
+    advance_time(&s.env, 3 * MONTH + 1);
+    s.client.process(&s.merchant, &svc1.service_id, &0, &10);
+
+    let allowance_after_3_charges = s.token.allowance(&s.subscriber, &s.contract_addr);
+    assert_eq!(allowance_after_3_charges, 12 * PRICE - 3 * PRICE + 12 * 500);
+
+    // Cancel sub1 — only the remaining 9-period budget should drop off.
+    s.client.cancel(&s.subscriber, &sub1.sub_id);
+
+    let allowance_after_cancel = s.token.allowance(&s.subscriber, &s.contract_addr);
+    assert_eq!(allowance_after_cancel, 12 * 500);
+}
+
+#[test]
+fn test_resubscribe_after_cancel_does_not_double_count_reservation() {
+    // LIB-8 (full fix): subscribe pruning must drop the prior sub's
+    // SubReservedAmount, otherwise a re-subscribe→cancel cycle would leave
+    // a phantom reservation in storage and a future cancel could try to
+    // remove budget that was never on chain. After the fix, the second
+    // cancel cleanly drops the active reservation and only that.
+    let s = setup();
+    let svc = register_default_service(&s);
+
+    let sub1 = s.client.subscribe(&s.subscriber, &svc.service_id, &true);
+    s.client.cancel(&s.subscriber, &sub1.sub_id);
+    assert_eq!(s.token.allowance(&s.subscriber, &s.contract_addr), 0);
+
+    advance_time(&s.env, MONTH + 1);
+
+    let sub2 = s.client.subscribe(&s.subscriber, &svc.service_id, &true);
+    let allowance_after_resub = s.token.allowance(&s.subscriber, &s.contract_addr);
+    assert_eq!(allowance_after_resub, 12 * PRICE);
+
+    s.client.cancel(&s.subscriber, &sub2.sub_id);
+    assert_eq!(s.token.allowance(&s.subscriber, &s.contract_addr), 0);
 }
 
 #[test]
